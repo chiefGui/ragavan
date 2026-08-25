@@ -328,12 +328,18 @@ fn enabled_repositories_reject_dev_commands_that_cannot_be_isolated() {
         Some(1),
         "{missing_package:?}"
     );
-    assert!(stderr(&missing_package).contains("no package.json"));
+    assert!(
+        stderr(&missing_package).contains("no package.json"),
+        "{missing_package:?}"
+    );
 
     repository.write_package(r#"{"scripts":{"dev":"next dev"}}"#);
     let unsupported = ragavan(repository.path(), &["__bun-arguments", "dev"]);
     assert_eq!(unsupported.status.code(), Some(1), "{unsupported:?}");
-    assert!(stderr(&unsupported).contains("this slice recognizes Vite"));
+    assert!(
+        stderr(&unsupported).contains("this slice recognizes Vite"),
+        "{unsupported:?}"
+    );
 }
 
 #[test]

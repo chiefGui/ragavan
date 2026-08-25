@@ -58,8 +58,25 @@ impl<'a> BunDev<'a> {
 
 fn nearest_package_json(worktree_root: &Path) -> Result<PathBuf, Error> {
     let current_directory = env::current_dir().map_err(Error::CurrentDirectory)?;
+    let resolved_current_directory =
+        fs::canonicalize(&current_directory).map_err(|source| Error::ResolveDirectory {
+            path: current_directory.clone(),
+            source,
+        })?;
+    let resolved_worktree_root =
+        fs::canonicalize(worktree_root).map_err(|source| Error::ResolveDirectory {
+            path: worktree_root.to_owned(),
+            source,
+        })?;
 
-    for directory in current_directory.ancestors() {
+    if !resolved_current_directory.starts_with(&resolved_worktree_root) {
+        return Err(Error::CurrentDirectoryOutsideWorktree {
+            current_directory,
+            root: worktree_root.to_owned(),
+        });
+    }
+
+    for directory in resolved_current_directory.ancestors() {
         let package_path = directory.join("package.json");
         match fs::metadata(&package_path) {
             Ok(metadata) if metadata.is_file() => return Ok(package_path),
@@ -73,7 +90,7 @@ fn nearest_package_json(worktree_root: &Path) -> Result<PathBuf, Error> {
             }
         }
 
-        if directory == worktree_root {
+        if directory == resolved_worktree_root {
             return Err(Error::MissingPackage {
                 root: worktree_root.to_owned(),
             });
@@ -89,6 +106,10 @@ fn nearest_package_json(worktree_root: &Path) -> Result<PathBuf, Error> {
 #[derive(Debug)]
 pub(crate) enum Error {
     CurrentDirectory(io::Error),
+    ResolveDirectory {
+        path: PathBuf,
+        source: io::Error,
+    },
     CurrentDirectoryOutsideWorktree {
         current_directory: PathBuf,
         root: PathBuf,
@@ -114,6 +135,13 @@ impl fmt::Display for Error {
         match self {
             Self::CurrentDirectory(source) => {
                 write!(formatter, "could not read the current directory: {source}")
+            }
+            Self::ResolveDirectory { path, source } => {
+                write!(
+                    formatter,
+                    "could not resolve directory {}: {source}",
+                    path.display()
+                )
             }
             Self::CurrentDirectoryOutsideWorktree {
                 current_directory,
@@ -148,6 +176,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::CurrentDirectory(source) => Some(source),
+            Self::ResolveDirectory { source, .. } => Some(source),
             Self::ReadPackage { source, .. } => Some(source),
             Self::ParsePackage { source, .. } => Some(source),
             _ => None,
