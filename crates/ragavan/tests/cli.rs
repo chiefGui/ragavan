@@ -112,8 +112,43 @@ fn unknown_commands_are_rejected_before_repository_access() {
     let output = ragavan(directory.path(), &["launch"]);
 
     assert_eq!(output.status.code(), Some(2), "{output:?}");
-    assert!(stderr(&output).contains("unknown command `launch`"));
-    assert!(stderr(&output).contains("Usage: ragavan <COMMAND>"));
+    assert!(stderr(&output).contains("unrecognized subcommand 'launch'"));
+    assert!(stderr(&output).contains("Usage: ragavan"));
+}
+
+#[test]
+fn unsupported_shells_are_rejected_before_installation() {
+    let directory = TempDirectory::new();
+    let output = ragavan(directory.path(), &["install", "bash"]);
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(stderr(&output).contains("invalid value 'bash'"));
+    assert!(stderr(&output).contains("possible values: powershell"));
+}
+
+#[test]
+fn automatic_shell_selection_refuses_to_guess() {
+    let directory = TempDirectory::new();
+    let output = ragavan(directory.path(), &["install"]);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).contains("could not detect a supported current shell"));
+    assert!(stderr(&output).contains("with `powershell`"));
+}
+
+#[test]
+fn powershell_can_be_selected_explicitly() {
+    let directory = TempDirectory::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_ragavan"))
+        .current_dir(directory.path())
+        .args(["install", "powershell"])
+        .env("PATH", "")
+        .output()
+        .expect("Ragavan should start");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).contains("could not find PowerShell"));
+    assert!(!stderr(&output).contains("Usage: ragavan <COMMAND>"));
 }
 
 #[test]
@@ -122,8 +157,11 @@ fn no_command_prints_help_before_repository_access() {
     let output = ragavan(directory.path(), &[]);
 
     assert_success(&output);
-    assert!(stdout(&output).contains("Usage: ragavan <COMMAND>"));
+    assert!(stdout(&output).contains("Usage: ragavan"));
+    assert!(stdout(&output).contains("install"));
+    assert!(stdout(&output).contains("uninstall"));
     assert!(stdout(&output).contains("enable"));
+    assert!(stdout(&output).contains("--json"));
     assert_eq!(stderr(&output), "");
 }
 
@@ -171,12 +209,112 @@ fn vite_ports_are_stable_and_distinct_across_worktrees() {
 fn bun_commands_pass_through_until_isolation_applies() {
     let directory = TempDirectory::new();
     assert_passthrough(ragavan(directory.path(), &["__bun-arguments", "dev"]));
+    assert_passthrough(ragavan(
+        directory.path(),
+        &["__bun-arguments", "dev", "--json"],
+    ));
 
     let repository = TestRepository::new();
     repository.write_package(r#"{"scripts":{"dev":"vite"}}"#);
     assert_passthrough(ragavan(repository.path(), &["__bun-arguments", "dev"]));
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
     assert_passthrough(ragavan(repository.path(), &["__bun-arguments", "test"]));
+}
+
+#[test]
+fn json_reports_enrollment_with_one_versioned_contract() {
+    let repository = TestRepository::new();
+
+    let enabled = ragavan(repository.path(), &["--json", "enable"]);
+    assert_success(&enabled);
+    assert_eq!(stderr(&enabled), "", "{enabled:?}");
+    assert_eq!(
+        json_stdout(&enabled),
+        serde_json::json!({"schema_version": 1, "enrollment": "enabled"})
+    );
+
+    let status = ragavan(repository.path(), &["status", "--json"]);
+    assert_success(&status);
+    assert_eq!(stderr(&status), "", "{status:?}");
+    assert_eq!(
+        json_stdout(&status),
+        serde_json::json!({"schema_version": 1, "enrollment": "enabled"})
+    );
+
+    let disabled = ragavan(repository.path(), &["disable", "--json"]);
+    assert_success(&disabled);
+    assert_eq!(stderr(&disabled), "", "{disabled:?}");
+    assert_eq!(
+        json_stdout(&disabled),
+        serde_json::json!({"schema_version": 1, "enrollment": "disabled"})
+    );
+}
+
+#[test]
+fn json_errors_preserve_usage_and_operation_failures() {
+    let directory = TempDirectory::new();
+
+    let usage = ragavan(directory.path(), &["--json", "launch"]);
+    assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+    assert_eq!(stdout(&usage), "", "{usage:?}");
+    let usage_error = json_stderr(&usage);
+    assert_eq!(usage_error["schema_version"], 1);
+    assert_eq!(usage_error["error"]["kind"], "usage");
+    assert!(
+        usage_error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unrecognized subcommand 'launch'")),
+        "{usage:?}"
+    );
+
+    let operation = ragavan(directory.path(), &["enable", "--json"]);
+    assert_eq!(operation.status.code(), Some(1), "{operation:?}");
+    assert_eq!(stdout(&operation), "", "{operation:?}");
+    let operation_error = json_stderr(&operation);
+    assert_eq!(operation_error["schema_version"], 1);
+    assert_eq!(operation_error["error"]["kind"], "operation");
+    assert!(
+        operation_error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not enable Ragavan")),
+        "{operation:?}"
+    );
+
+    let integration = Command::new(env!("CARGO_BIN_EXE_ragavan"))
+        .current_dir(directory.path())
+        .args(["install", "powershell", "--json"])
+        .env("PATH", "")
+        .output()
+        .expect("Ragavan should start");
+    assert_eq!(integration.status.code(), Some(1), "{integration:?}");
+    assert_eq!(stdout(&integration), "", "{integration:?}");
+    let integration_error = json_stderr(&integration);
+    assert_eq!(integration_error["error"]["kind"], "operation");
+    assert!(
+        integration_error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not find PowerShell")),
+        "{integration:?}"
+    );
+}
+
+#[test]
+fn json_does_not_replace_shell_protocol_output() {
+    let output = ragavan(
+        TempDirectory::new().path(),
+        &["hook", "powershell", "--json"],
+    );
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(stdout(&output), "", "{output:?}");
+    let error = json_stderr(&output);
+    assert_eq!(error["error"]["kind"], "usage");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unavailable for `hook`")),
+        "{output:?}"
+    );
 }
 
 #[test]
@@ -220,9 +358,35 @@ fn powershell_hook_wraps_bun_without_owning_vite_arguments() {
     let hook = stdout(&output);
     assert!(hook.contains("function global:bun"));
     assert!(hook.contains("__bun-arguments"));
+    assert!(hook.contains("ErrorAction SilentlyContinue"));
     assert!(!hook.contains("__RAGAVAN_PASSTHROUGH_EXIT_CODE__"));
     assert!(!hook.contains("--port"));
     assert!(!hook.contains("--strictPort"));
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_hook_is_quiet_when_bun_is_unavailable() {
+    let directory = TempDirectory::new();
+    let ragavan_executable = Path::new(env!("CARGO_BIN_EXE_ragavan"));
+    let ragavan_directory = ragavan_executable
+        .parent()
+        .expect("Ragavan test executable should have a parent directory");
+
+    let output = Command::new("powershell.exe")
+        .current_dir(directory.path())
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$hook = ragavan hook powershell | Out-String; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Invoke-Expression $hook; if ($null -ne (Get-Command bun -CommandType Function -ErrorAction SilentlyContinue)) { exit 1 }; exit 0",
+        ])
+        .env("PATH", ragavan_directory)
+        .output()
+        .expect("PowerShell should start");
+
+    assert_success(&output);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "");
 }
 
 #[cfg(windows)]
@@ -432,4 +596,12 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn json_stdout(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).expect("stdout should contain one JSON value")
+}
+
+fn json_stderr(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stderr).expect("stderr should contain one JSON value")
 }
