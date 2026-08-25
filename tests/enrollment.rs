@@ -7,6 +7,7 @@ use std::{
 
 const ENABLED: &str = "Ragavan is enabled for this repository.\n";
 const DISABLED: &str = "Ragavan is disabled for this repository.\n";
+const PASSTHROUGH_EXIT_CODE: i32 = 10;
 
 static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -41,10 +42,30 @@ fn enrollment_changes_are_idempotent_and_reversible() {
     let repository = TestRepository::new();
 
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+    let repository_id = stdout(&git(
+        repository.path(),
+        &["config", "--local", "--get", "ragavan.repositoryId"],
+    ));
+    assert!(!repository_id.trim().is_empty());
+
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+    assert_stdout(
+        git(
+            repository.path(),
+            &["config", "--local", "--get", "ragavan.repositoryId"],
+        ),
+        &repository_id,
+    );
+
     assert_stdout(ragavan(repository.path(), &["disable"]), DISABLED);
     assert_stdout(ragavan(repository.path(), &["disable"]), DISABLED);
     assert_stdout(ragavan(repository.path(), &["status"]), DISABLED);
+
+    let repository_id = git(
+        repository.path(),
+        &["config", "--local", "--get", "ragavan.repositoryId"],
+    );
+    assert_eq!(repository_id.status.code(), Some(1), "{repository_id:?}");
 }
 
 #[test]
@@ -106,6 +127,157 @@ fn no_command_prints_help_before_repository_access() {
     assert_eq!(stderr(&output), "");
 }
 
+#[test]
+fn vite_ports_are_stable_and_distinct_across_worktrees() {
+    let repository = TestRepository::new();
+    repository.write_package(r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(
+        git(
+            repository.path(),
+            &["config", "extensions.worktreeConfig", "true"],
+        ),
+        "",
+    );
+    assert_stdout(
+        git(
+            repository.path(),
+            &[
+                "config",
+                "--local",
+                "ragavan.repositoryId",
+                "stable-port-test-repository",
+            ],
+        ),
+        "",
+    );
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let main_port = vite_port(repository.path());
+    assert_eq!(vite_port(repository.path()), main_port);
+
+    let linked_worktree = repository.add_worktree("linked");
+    let linked_port = vite_port(&linked_worktree);
+    assert_ne!(linked_port, main_port);
+
+    let moved_worktree = repository.move_worktree(&linked_worktree, "moved");
+    assert_eq!(vite_port(&moved_worktree), linked_port);
+
+    for worktree in [repository.path(), &moved_worktree] {
+        assert_stdout(git(worktree, &["status", "--porcelain"]), "");
+    }
+}
+
+#[test]
+fn bun_commands_pass_through_until_isolation_applies() {
+    let directory = TempDirectory::new();
+    assert_passthrough(ragavan(directory.path(), &["__bun-arguments", "dev"]));
+
+    let repository = TestRepository::new();
+    repository.write_package(r#"{"scripts":{"dev":"vite"}}"#);
+    assert_passthrough(ragavan(repository.path(), &["__bun-arguments", "dev"]));
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+    assert_passthrough(ragavan(repository.path(), &["__bun-arguments", "test"]));
+}
+
+#[test]
+fn enabled_repositories_reject_dev_commands_that_cannot_be_isolated() {
+    let repository = TestRepository::new();
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let missing_package = ragavan(repository.path(), &["__bun-arguments", "dev"]);
+    assert_eq!(
+        missing_package.status.code(),
+        Some(1),
+        "{missing_package:?}"
+    );
+    assert!(stderr(&missing_package).contains("no package.json"));
+
+    repository.write_package(r#"{"scripts":{"dev":"next dev"}}"#);
+    let unsupported = ragavan(repository.path(), &["__bun-arguments", "dev"]);
+    assert_eq!(unsupported.status.code(), Some(1), "{unsupported:?}");
+    assert!(stderr(&unsupported).contains("this slice recognizes Vite"));
+}
+
+#[test]
+fn explicit_vite_ports_are_rejected_instead_of_overridden() {
+    let repository = TestRepository::new();
+    repository.write_package(r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let output = ragavan(
+        repository.path(),
+        &["__bun-arguments", "run", "dev", "--port", "4567"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).contains("explicit `--port`"));
+}
+
+#[test]
+fn powershell_hook_wraps_bun_without_owning_vite_arguments() {
+    let output = ragavan(TempDirectory::new().path(), &["hook", "powershell"]);
+
+    assert_success(&output);
+    let hook = stdout(&output);
+    assert!(hook.contains("function global:bun"));
+    assert!(hook.contains("__bun-arguments"));
+    assert!(!hook.contains("__RAGAVAN_PASSTHROUGH_EXIT_CODE__"));
+    assert!(!hook.contains("--port"));
+    assert!(!hook.contains("--strictPort"));
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_adapts_bun_dev_and_preserves_other_bun_commands() {
+    let repository = TestRepository::new();
+    repository.write_package(r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let fake_commands = TempDirectory::new();
+    fs::write(
+        fake_commands.path().join("bun.cmd"),
+        "@echo off\r\nfor %%A in (%*) do @echo %%~A\r\n",
+    )
+    .expect("fake Bun command should be written");
+
+    let ragavan_executable = Path::new(env!("CARGO_BIN_EXE_ragavan"));
+    let ragavan_directory = ragavan_executable
+        .parent()
+        .expect("Ragavan test executable should have a parent directory");
+    let mut command_paths = vec![
+        fake_commands.path().to_owned(),
+        ragavan_directory.to_owned(),
+    ];
+    command_paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+    let command_path = env::join_paths(command_paths).expect("test PATH should be valid");
+
+    let output = Command::new("powershell.exe")
+        .current_dir(repository.path())
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$hook = ragavan hook powershell | Out-String; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Invoke-Expression $hook; bun dev; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bun test --watch; exit $LASTEXITCODE",
+        ])
+        .env("PATH", command_path)
+        .output()
+        .expect("PowerShell should start");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let arguments: Vec<_> = stdout.lines().collect();
+    assert_eq!(arguments.first(), Some(&"dev"), "{output:?}");
+    assert_eq!(arguments.get(1), Some(&"--port"), "{output:?}");
+    let port: u16 = arguments
+        .get(2)
+        .expect("port argument should exist")
+        .parse()
+        .expect("port argument should be numeric");
+    assert_ne!(port, 0, "{output:?}");
+    assert_eq!(arguments.get(3), Some(&"--strictPort"), "{output:?}");
+    assert_eq!(arguments.get(4), Some(&"test"), "{output:?}");
+    assert_eq!(arguments.get(5), Some(&"--watch"), "{output:?}");
+    assert_eq!(arguments.len(), 6, "{output:?}");
+}
+
 struct TestRepository {
     directory: TempDirectory,
     path: PathBuf,
@@ -151,6 +323,26 @@ impl TestRepository {
             .expect("Git should start");
         assert_success(&output);
         path
+    }
+
+    fn move_worktree(&self, path: &Path, name: &str) -> PathBuf {
+        let destination = self.directory.path().join(name);
+        let output = Command::new("git")
+            .current_dir(&self.path)
+            .args(["worktree", "move"])
+            .arg(path)
+            .arg(&destination)
+            .output()
+            .expect("Git should start");
+        assert_success(&output);
+        destination
+    }
+
+    fn write_package(&self, contents: &str) {
+        fs::write(self.path.join("package.json"), contents)
+            .expect("package.json should be written");
+        assert_stdout(git(&self.path, &["add", "package.json"]), "");
+        assert_success(&git(&self.path, &["commit", "-m", "add package"]));
     }
 }
 
@@ -206,6 +398,28 @@ fn assert_stdout(output: Output, expected: &str) {
     assert_success(&output);
     assert_eq!(stdout(&output), expected, "{output:?}");
     assert_eq!(stderr(&output), "", "{output:?}");
+}
+
+fn assert_passthrough(output: Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(PASSTHROUGH_EXIT_CODE),
+        "{output:?}"
+    );
+    assert_eq!(stdout(&output), "", "{output:?}");
+    assert_eq!(stderr(&output), "", "{output:?}");
+}
+
+fn vite_port(directory: &Path) -> u16 {
+    let output = ragavan(directory, &["__bun-arguments", "dev"]);
+    assert_success(&output);
+    assert_eq!(stderr(&output), "", "{output:?}");
+
+    let arguments: Vec<_> = stdout(&output).lines().map(str::to_owned).collect();
+    assert_eq!(arguments.first().map(String::as_str), Some("--port"));
+    assert_eq!(arguments.get(2).map(String::as_str), Some("--strictPort"));
+    assert_eq!(arguments.len(), 3);
+    arguments[1].parse().expect("port should be numeric")
 }
 
 fn assert_success(output: &Output) {

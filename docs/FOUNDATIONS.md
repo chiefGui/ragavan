@@ -7,10 +7,10 @@ environments without changing the commands developers already use.
 
 ## Core promise
 
-Once Ragavan is enabled for a local repository, supported development stacks
-keep using their normal commands, such as `bun dev`, `npm start`, and
-`docker compose up`. Enrollment happens at most once for the repository and
-applies to every current and future worktree.
+After one user-level integration and one local repository enrollment, supported
+development stacks keep using their normal commands, such as `bun dev`,
+`npm start`, and `docker compose up`. Enrollment happens at most once for the
+repository and applies to every current and future worktree.
 
 Ragavan owns the orchestration behind those commands. The repository should not
 need Ragavan-specific configuration or application changes.
@@ -21,6 +21,8 @@ need Ragavan-specific configuration or application changes.
 - Git remains the source of truth for worktrees and branches.
 - Repository enrollment is explicit, local, reversible, and shared by all of its
   worktrees.
+- User-level integration is explicit and never repeated per repository or
+  worktree.
 - Individual worktrees require no setup.
 - Normal development commands remain normal development commands.
 - Ragavan does not edit application source or package manifests to gain control.
