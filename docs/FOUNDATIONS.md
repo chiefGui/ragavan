@@ -7,9 +7,10 @@ environments without changing the commands developers already use.
 
 ## Core promise
 
-After installing Ragavan and running `ragavan init`, supported repositories keep
-using their normal commands, such as `bun dev`, `npm start`, and
-`docker compose up`.
+Once Ragavan is enabled for a local repository, supported development stacks
+keep using their normal commands, such as `bun dev`, `npm start`, and
+`docker compose up`. Enrollment happens at most once for the repository and
+applies to every current and future worktree.
 
 Ragavan owns the orchestration behind those commands. The repository should not
 need Ragavan-specific configuration or application changes.
@@ -18,6 +19,9 @@ need Ragavan-specific configuration or application changes.
 
 - Zero project configuration for supported development stacks.
 - Git remains the source of truth for worktrees and branches.
+- Repository enrollment is explicit, local, reversible, and shared by all of its
+  worktrees.
+- Individual worktrees require no setup.
 - Normal development commands remain normal development commands.
 - Ragavan does not edit application source or package manifests to gain control.
 - A worktree's identity survives branch renames and path changes.
@@ -26,22 +30,15 @@ need Ragavan-specific configuration or application changes.
 - Unsupported cases fail clearly instead of making dangerous guesses.
 - The common path stays quiet, fast, and conceptually small.
 
-## Conceptual model
+## Scope
 
-```text
-Project -> Worktree -> Session -> Resources
-```
+- A **repository** is the single enrollment boundary shared by its worktrees.
+- A **worktree** is the isolation boundary and has an identity independent of its
+  current branch or path.
+- Every allocated resource has one explicit owner and cleanup lifecycle.
 
-- A **project** represents one Git repository and its shared worktree state.
-- A **worktree** has a stable identity independent of its current branch or path.
-- A **session** is a supervised command running within a worktree context.
-- **Resources** are leases owned by that session, such as ports, URLs, process
-  groups, and container namespaces.
-
-Adapters recognize supported development stacks and describe the environment or
-command adjustments they require. Adapters do not execute processes themselves.
-The runtime remains the sole owner of process execution, terminal behavior,
-resource allocation, and cleanup.
+Stack-specific support may describe required launch adjustments, but it does not
+own process execution, terminal behavior, resource allocation, or cleanup.
 
 ## Initial proof
 
@@ -65,8 +62,8 @@ architecture.
 
 ## Success
 
-The user learns `ragavan init` and nothing else.
+The repository is enrolled once. Every worktree then uses its existing
+development commands without additional Ragavan setup.
 
 When Ragavan recognizes the repository, isolation feels automatic. When it does
 not, it explains exactly what prevented isolation and what capability is missing.
-

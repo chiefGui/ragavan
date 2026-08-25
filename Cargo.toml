@@ -1,19 +1,15 @@
-[workspace]
-members = ["crates/*"]
-default-members = ["crates/ragavan"]
-resolver = "3"
-
-[workspace.package]
+[package]
+name = "ragavan"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 publish = false
 
-[workspace.lints.rust]
+[lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_lifetimes = "deny"
 
-[workspace.lints.clippy]
+[lints.clippy]
 all = { level = "deny", priority = -1 }
 dbg_macro = "deny"
 todo = "deny"
