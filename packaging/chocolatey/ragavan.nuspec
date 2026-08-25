@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>ragavan</id>
+    <version>$version$</version>
+    <title>Ragavan</title>
+    <authors>chiefGui</authors>
+    <owners>chiefGui</owners>
+    <projectUrl>https://github.com/chiefGui/ragavan</projectUrl>
+    <packageSourceUrl>https://github.com/chiefGui/ragavan</packageSourceUrl>
+    <docsUrl>https://github.com/chiefGui/ragavan#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/chiefGui/ragavan/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/chiefGui/ragavan/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>Ragavan gives concurrent Git worktrees isolated development environments without changing the commands developers already use.
+
+This early preview supports PowerShell, Bun, and simple Vite development scripts. In an enabled repository, commands such as `bun dev` receive a stable worktree-specific port automatically.</description>
+    <summary>Zero-config development isolation for concurrent Git worktrees.</summary>
+    <releaseNotes>https://github.com/chiefGui/ragavan/releases</releaseNotes>
+    <copyright>Copyright (c) 2026 chiefGui</copyright>
+    <tags>ragavan git worktree worktrees development bun vite cli powershell</tags>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $packages = @($metadata.packages | Where-Object { $_.name -eq 'ragavan' })
+          if ($packages.Count -ne 1) {
+              throw "Expected exactly one Cargo package named 'ragavan'; found $($packages.Count)."
+          }
+
+          $version = [string] $packages[0].version
+          $expectedTag = "v$version"
+          if ($env:GITHUB_REF_NAME -cne $expectedTag) {
+              throw "Release tag '$env:GITHUB_REF_NAME' must match Cargo version '$expectedTag'."
+          }
+
+          "RAGAVAN_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Build release artifacts
+        shell: pwsh
+        run: .\packaging\chocolatey\pack.ps1 -Version $env:RAGAVAN_VERSION
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifacts = @(
+              'target\distribution\ragavan.exe',
+              'target\distribution\ragavan.exe.sha256',
+              "target\distribution\ragavan.$env:RAGAVAN_VERSION.nupkg"
+          )
+
+          gh release create $env:GITHUB_REF_NAME $artifacts `
+              --verify-tag `
+              --generate-notes `
+              --title "Ragavan $env:GITHUB_REF_NAME"
+
+      - name: Publish Chocolatey package
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          $package = "target\distribution\ragavan.$env:RAGAVAN_VERSION.nupkg"
+          choco push $package `
+              --source 'https://push.chocolatey.org/' `
+              --api-key $env:CHOCOLATEY_API_KEY

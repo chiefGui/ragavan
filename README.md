@@ -11,6 +11,27 @@ environments without changing the commands developers already use.
 The project's durable product and architectural constraints live in
 [Ragavan Foundations](docs/FOUNDATIONS.md).
 
+## Install on Windows
+
+Windows releases are distributed as self-contained Chocolatey packages. The
+package puts `ragavan` on `PATH` and installs its PowerShell integration for the
+user running Chocolatey:
+
+```powershell
+choco install ragavan -y
+```
+
+Open a new PowerShell session after installation. Future versions use the
+ordinary Chocolatey workflow; no Ragavan-specific updater or server is needed:
+
+```powershell
+choco upgrade ragavan -y
+choco uninstall ragavan -y
+```
+
+The first release remains unavailable until its package passes Chocolatey
+community moderation.
+
 ## Try the current slice
 
 Repository enrollment is local, applies to every worktree, and never modifies
