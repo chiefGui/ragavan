@@ -1,0 +1,7 @@
+interface:
+  display_name: "Code Quality"
+  short_description: "Apply strict, minimal code-quality rules"
+  default_prompt: "Use $code-quality to improve this task's code."
+
+policy:
+  allow_implicit_invocation: false

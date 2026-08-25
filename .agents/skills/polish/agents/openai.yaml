@@ -1,0 +1,7 @@
+interface:
+  display_name: "Polish"
+  short_description: "Polish this task's code changes"
+  default_prompt: "Use $polish to polish this task's code changes."
+
+policy:
+  allow_implicit_invocation: false
