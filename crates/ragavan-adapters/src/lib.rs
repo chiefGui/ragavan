@@ -1,13 +1,15 @@
 #![forbid(unsafe_code)]
 
 mod bun;
+mod npm;
 mod package_json;
+mod pnpm;
 mod script;
 mod vite;
 mod vite_plus;
 
 use ragavan_core::{LaunchPlan, Port};
-use script::Invocation;
+use script::{Invocation, Script};
 use std::{
     ffi::{OsStr, OsString},
     fmt,
@@ -16,7 +18,7 @@ use std::{
 
 struct Runner {
     command: &'static str,
-    resolve: for<'a> fn(&'a [OsString], &Path) -> Result<Option<ResolvedScript<'a>>, Error>,
+    recognize: for<'a> fn(&'a [OsString]) -> Option<DevelopmentCommand<'a>>,
 }
 
 struct Stack {
@@ -24,7 +26,7 @@ struct Stack {
     adjust: fn(&Invocation, &[OsString], &'static str) -> Result<StackAdjustment, Error>,
 }
 
-const RUNNERS: &[Runner] = &[bun::ADAPTER];
+const RUNNERS: &[Runner] = &[bun::ADAPTER, npm::ADAPTER, pnpm::ADAPTER];
 
 const STACKS: &[Stack] = &[vite::ADAPTER, vite_plus::ADAPTER];
 
@@ -33,22 +35,78 @@ pub fn commands() -> impl Iterator<Item = &'static str> {
     RUNNERS.iter().map(|runner| runner.command)
 }
 
-/// Recognize a registered command and describe its port-specific adjustment.
-pub fn recognize(
+/// Recognize a registered package runner's development command without inspecting the project.
+pub fn development_command<'a>(
     command: &OsStr,
-    arguments: &[OsString],
-    worktree_root: &Path,
-) -> Result<Option<PortAdjustment>, Error> {
-    let Some(command) = command.to_str() else {
-        return Ok(None);
-    };
-    let Some(runner) = RUNNERS.iter().find(|runner| runner.command == command) else {
-        return Ok(None);
-    };
-    let Some(script) = (runner.resolve)(arguments, worktree_root)? else {
-        return Ok(None);
-    };
+    arguments: &'a [OsString],
+) -> Option<DevelopmentCommand<'a>> {
+    let command = command.to_str()?;
+    let runner = RUNNERS.iter().find(|runner| runner.command == command)?;
 
+    (runner.recognize)(arguments)
+}
+
+/// A package-script command that may require worktree isolation.
+pub struct DevelopmentCommand<'a> {
+    invocation: &'static str,
+    script_name: &'static str,
+    forwarded_arguments: &'a [OsString],
+    deliver_arguments: fn(Vec<String>) -> Vec<String>,
+}
+
+impl<'a> DevelopmentCommand<'a> {
+    fn new(
+        invocation: &'static str,
+        script_name: &'static str,
+        forwarded_arguments: &'a [OsString],
+        deliver_arguments: fn(Vec<String>) -> Vec<String>,
+    ) -> Self {
+        Self {
+            invocation,
+            script_name,
+            forwarded_arguments,
+            deliver_arguments,
+        }
+    }
+
+    /// Resolve the package script and describe its port-specific adjustment.
+    pub fn resolve(self, worktree_root: &Path) -> Result<PortAdjustment, Error> {
+        let package_script =
+            package_json::find_script(worktree_root, self.script_name).map_err(|source| {
+                Error(ErrorKind::Package {
+                    invocation: self.invocation,
+                    source,
+                })
+            })?;
+        let (package_path, source) = package_script.into_parts();
+        let script = match Script::parse(&source) {
+            Ok(script) => script,
+            Err(source_error) => {
+                return Err(Error(ErrorKind::UnsupportedSyntax {
+                    invocation: self.invocation,
+                    path: package_path,
+                    script: source,
+                    source: source_error,
+                }));
+            }
+        };
+
+        resolve_stack(ResolvedScript {
+            invocation: self.invocation,
+            package_path,
+            source,
+            script,
+            arguments: self.forwarded_arguments,
+            deliver_arguments: self.deliver_arguments,
+        })
+    }
+}
+
+fn deliver_directly(arguments: Vec<String>) -> Vec<String> {
+    arguments
+}
+
+fn resolve_stack(script: ResolvedScript<'_>) -> Result<PortAdjustment, Error> {
     let mut recognized = None;
 
     for (index, invocation) in script.script.invocations().iter().enumerate() {
@@ -74,7 +132,7 @@ pub fn recognize(
             script: script.source,
         }));
     };
-    if index != script.argument_sink {
+    if index != script.script.invocations().len() - 1 {
         return Err(Error(ErrorKind::UnsafeArgumentDelivery {
             invocation: script.invocation,
             path: script.package_path,
@@ -83,23 +141,23 @@ pub fn recognize(
     }
 
     let stack_adjustment = (stack.adjust)(invocation, script.arguments, script.invocation)?;
-    Ok(Some(PortAdjustment {
+    Ok(PortAdjustment {
         port_arguments: stack_adjustment.port_arguments,
-        forward_script_arguments: script.forward_script_arguments,
-    }))
+        deliver_arguments: script.deliver_arguments,
+    })
 }
 
 /// A recognized command's runner-aware adjustment for an allocated port.
 pub struct PortAdjustment {
     port_arguments: fn(Port) -> Vec<String>,
-    forward_script_arguments: fn(Vec<String>) -> Vec<String>,
+    deliver_arguments: fn(Vec<String>) -> Vec<String>,
 }
 
 impl PortAdjustment {
     /// Build the arguments that must be appended to the original command.
     pub fn launch_plan(self, port: Port) -> LaunchPlan {
         let arguments = (self.port_arguments)(port);
-        LaunchPlan::with_additional_arguments((self.forward_script_arguments)(arguments))
+        LaunchPlan::with_additional_arguments((self.deliver_arguments)(arguments))
     }
 }
 
@@ -112,9 +170,8 @@ struct ResolvedScript<'a> {
     package_path: PathBuf,
     source: String,
     script: script::Script,
-    argument_sink: usize,
     arguments: &'a [OsString],
-    forward_script_arguments: fn(Vec<String>) -> Vec<String>,
+    deliver_arguments: fn(Vec<String>) -> Vec<String>,
 }
 
 #[derive(Debug)]
@@ -122,7 +179,16 @@ pub struct Error(ErrorKind);
 
 #[derive(Debug)]
 enum ErrorKind {
-    Runner(Box<dyn std::error::Error>),
+    Package {
+        invocation: &'static str,
+        source: package_json::Error,
+    },
+    UnsupportedSyntax {
+        invocation: &'static str,
+        path: PathBuf,
+        script: String,
+        source: script::Error,
+    },
     Stack(Box<dyn std::error::Error>),
     UnsupportedScript {
         invocation: &'static str,
@@ -142,10 +208,6 @@ enum ErrorKind {
 }
 
 impl Error {
-    fn runner(error: impl std::error::Error + 'static) -> Self {
-        Self(ErrorKind::Runner(Box::new(error)))
-    }
-
     fn stack(error: impl std::error::Error + 'static) -> Self {
         Self(ErrorKind::Stack(Box::new(error)))
     }
@@ -154,7 +216,20 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
-            ErrorKind::Runner(error) | ErrorKind::Stack(error) => error.fmt(formatter),
+            ErrorKind::Package { invocation, source } => {
+                write!(formatter, "could not isolate `{invocation}`: {source}")
+            }
+            ErrorKind::UnsupportedSyntax {
+                invocation,
+                path,
+                script,
+                source,
+            } => write!(
+                formatter,
+                "could not isolate `{invocation}`: {} uses unsupported script {script:?}: {source}",
+                path.display()
+            ),
+            ErrorKind::Stack(error) => error.fmt(formatter),
             ErrorKind::UnsupportedScript {
                 invocation,
                 path,
@@ -189,7 +264,9 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.0 {
-            ErrorKind::Runner(error) | ErrorKind::Stack(error) => Some(error.as_ref()),
+            ErrorKind::Package { source, .. } => Some(source),
+            ErrorKind::UnsupportedSyntax { source, .. } => Some(source),
+            ErrorKind::Stack(error) => Some(error.as_ref()),
             ErrorKind::UnsupportedScript { .. }
             | ErrorKind::AmbiguousScript { .. }
             | ErrorKind::UnsafeArgumentDelivery { .. } => None,

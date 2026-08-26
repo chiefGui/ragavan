@@ -322,13 +322,14 @@ fn isolate_command(
     command: &std::ffi::OsStr,
     arguments: &[OsString],
 ) -> Result<Option<(ragavan_runtime::PortLease, LaunchPlan)>, Failure> {
+    let Some(development_command) = ragavan_adapters::development_command(command, arguments)
+    else {
+        return Ok(None);
+    };
     let Some(worktree) = ragavan_git::enrolled_worktree()? else {
         return Ok(None);
     };
-
-    let Some(adjustment) = ragavan_adapters::recognize(command, arguments, worktree.root())? else {
-        return Ok(None);
-    };
+    let adjustment = development_command.resolve(worktree.root())?;
     let identity = worktree.identity()?;
     let lease = ragavan_runtime::acquire_port(&identity)?;
     let plan = adjustment.launch_plan(lease.port());

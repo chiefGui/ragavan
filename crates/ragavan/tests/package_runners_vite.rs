@@ -75,7 +75,7 @@ fn supervised_worktrees_own_distinct_stable_ports_until_exit() {
     write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
     let linked_worktree = repository.add_worktree("supervised");
-    let bun = FakeBun::waiting();
+    let bun = FakeCommand::waiting("bun");
 
     let (main_process, main_port) = start_bun(repository.path(), bun.path());
     let (linked_process, linked_port) = start_bun(&linked_worktree, bun.path());
@@ -135,9 +135,145 @@ fn bun_commands_pass_through_until_isolation_applies() {
 }
 
 #[test]
+fn npm_and_pnpm_run_vite_with_the_worktree_port() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vite","start":"vite"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    for (command, arguments, expected) in [
+        (
+            "npm",
+            &["run", "dev"][..],
+            &["run", "dev", "--", "--port", "<port>", "--strictPort"][..],
+        ),
+        (
+            "npm",
+            &["run-script", "dev"][..],
+            &[
+                "run-script",
+                "dev",
+                "--",
+                "--port",
+                "<port>",
+                "--strictPort",
+            ][..],
+        ),
+        (
+            "npm",
+            &["start"][..],
+            &["start", "--", "--port", "<port>", "--strictPort"][..],
+        ),
+        (
+            "npm",
+            &["run", "start"][..],
+            &["run", "start", "--", "--port", "<port>", "--strictPort"][..],
+        ),
+        (
+            "pnpm",
+            &["dev"][..],
+            &["dev", "--port", "<port>", "--strictPort"][..],
+        ),
+        (
+            "pnpm",
+            &["run", "dev"][..],
+            &["run", "dev", "--port", "<port>", "--strictPort"][..],
+        ),
+        (
+            "pnpm",
+            &["run-script", "dev"][..],
+            &["run-script", "dev", "--port", "<port>", "--strictPort"][..],
+        ),
+        (
+            "pnpm",
+            &["start"][..],
+            &["start", "--port", "<port>", "--strictPort"][..],
+        ),
+        (
+            "pnpm",
+            &["run", "start"][..],
+            &["run", "start", "--port", "<port>", "--strictPort"][..],
+        ),
+    ] {
+        let output = package_runner(repository.path(), command, arguments);
+        assert_eq!(
+            normalized_arguments(output),
+            expected,
+            "{command} {arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn npm_reuses_an_existing_script_argument_separator() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let output = package_runner(
+        repository.path(),
+        "npm",
+        &["run", "dev", "--", "--host", "127.0.0.1"],
+    );
+
+    assert_eq!(
+        normalized_arguments(output),
+        [
+            "run",
+            "dev",
+            "--",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "<port>",
+            "--strictPort",
+        ]
+    );
+}
+
+#[test]
+fn npm_and_pnpm_reject_explicit_vite_ports() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    for (command, arguments) in [
+        ("npm", &["run", "dev", "--", "--port", "4567"][..]),
+        ("pnpm", &["dev", "--port=5678"][..]),
+    ] {
+        let output = package_runner(repository.path(), command, arguments);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stderr(&output).contains("explicit `--port`"), "{output:?}");
+    }
+}
+
+#[test]
+fn unrelated_npm_and_pnpm_commands_take_the_direct_pass_through_path() {
+    let directory = TempDirectory::new();
+
+    for (command, arguments) in [
+        ("npm", &["install", "example-package"][..]),
+        ("pnpm", &["test", "--watch"][..]),
+    ] {
+        let executable = FakeCommand::printing(command);
+        let output = ragavan_command(directory.path())
+            .arg("__run")
+            .arg(command)
+            .arg(executable.path())
+            .args(arguments)
+            .env("PATH", "")
+            .output()
+            .expect("Ragavan should pass through the package-manager command");
+
+        assert_success(&output);
+        assert_eq!(stderr(&output), "", "{output:?}");
+        assert_eq!(stdout(&output).lines().collect::<Vec<_>>(), arguments);
+    }
+}
+
+#[test]
 fn bun_exit_status_is_preserved() {
     let directory = TempDirectory::new();
-    let bun = FakeBun::exiting(37);
+    let bun = FakeCommand::exiting("bun", 37);
     let output = run_bun(directory.path(), bun.path(), &["test"]);
 
     assert_eq!(output.status.code(), Some(37), "{output:?}");
@@ -248,14 +384,18 @@ fn multiple_recognized_development_servers_are_rejected() {
 }
 
 #[test]
-fn powershell_hook_wraps_bun_without_owning_vite_arguments() {
+fn powershell_hook_wraps_package_runners_without_owning_vite_arguments() {
     let output = ragavan(TempDirectory::new().path(), &["hook", "powershell"]);
 
     assert_success(&output);
     let hook = stdout(&output);
-    assert!(hook.contains("function global:bun"));
-    assert!(hook.contains("__run 'bun'"));
-    assert!(hook.contains("__RagavanOriginalCommands['bun'].Path"));
+    for command in ["bun", "npm", "pnpm"] {
+        assert!(hook.contains(&format!("function global:{command}")));
+        assert!(hook.contains(&format!("__run '{command}'")));
+        assert!(hook.contains(&format!("__RagavanOriginalCommands['{command}'].Path")));
+    }
+    assert!(!hook.contains("function global:yarn"));
+    assert!(!hook.contains("ExternalScript"));
     assert!(hook.contains("ErrorAction SilentlyContinue"));
     assert!(!hook.contains("__bun-arguments"));
     assert!(!hook.contains("--port"));
@@ -274,7 +414,7 @@ fn outdated_powershell_hooks_fail_with_a_reload_instruction() {
 
 #[cfg(windows)]
 #[test]
-fn powershell_hook_is_quiet_when_bun_is_unavailable() {
+fn powershell_hook_is_quiet_when_package_runners_are_unavailable() {
     let directory = TempDirectory::new();
     let ragavan_executable = Path::new(env!("CARGO_BIN_EXE_ragavan"));
     let ragavan_directory = ragavan_executable
@@ -286,7 +426,7 @@ fn powershell_hook_is_quiet_when_bun_is_unavailable() {
         .args([
             "-NoProfile",
             "-Command",
-            "$hook = ragavan hook powershell | Out-String; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Invoke-Expression $hook; if ($null -ne (Get-Command bun -CommandType Function -ErrorAction SilentlyContinue)) { exit 1 }; exit 0",
+            "$hook = ragavan hook powershell | Out-String; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Invoke-Expression $hook; foreach ($command in @('bun', 'npm', 'pnpm')) { if ($null -ne (Get-Command $command -CommandType Function -ErrorAction SilentlyContinue)) { exit 1 } }; exit 0",
         ])
         .env("PATH", ragavan_directory)
         .output()
@@ -299,17 +439,19 @@ fn powershell_hook_is_quiet_when_bun_is_unavailable() {
 
 #[cfg(windows)]
 #[test]
-fn powershell_adapts_bun_dev_and_preserves_other_bun_commands() {
+fn powershell_adapts_package_runners_and_preserves_other_commands() {
     let repository = TestRepository::new();
     write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
 
     let fake_commands = TempDirectory::new();
-    fs::write(
-        fake_commands.path().join("bun.cmd"),
-        "@echo off\r\nfor %%A in (%*) do @echo %%~A\r\n",
-    )
-    .expect("fake Bun command should be written");
+    for command in ["bun", "npm", "pnpm"] {
+        fs::write(
+            fake_commands.path().join(format!("{command}.cmd")),
+            "@echo off\r\nfor %%A in (%*) do @echo %%~A\r\n",
+        )
+        .expect("fake package-manager command should be written");
+    }
 
     let ragavan_executable = Path::new(env!("CARGO_BIN_EXE_ragavan"));
     let ragavan_directory = ragavan_executable
@@ -327,28 +469,34 @@ fn powershell_adapts_bun_dev_and_preserves_other_bun_commands() {
         .args([
             "-NoProfile",
             "-Command",
-            "$hook = ragavan hook powershell | Out-String; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Invoke-Expression $hook; bun dev; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bun test --watch; exit $LASTEXITCODE",
+            "$hook = ragavan hook powershell | Out-String; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Invoke-Expression $hook; bun dev; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run dev; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm dev; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm test --watch; exit $LASTEXITCODE",
         ])
         .env("PATH", command_path)
         .env(state_home_variable(), test_state_home(repository.path()))
         .output()
         .expect("PowerShell should start");
 
-    assert_success(&output);
-    let stdout = stdout(&output);
-    let arguments: Vec<_> = stdout.lines().collect();
-    assert_eq!(arguments.first(), Some(&"dev"), "{output:?}");
-    assert_eq!(arguments.get(1), Some(&"--port"), "{output:?}");
-    let port: u16 = arguments
-        .get(2)
-        .expect("port argument should exist")
-        .parse()
-        .expect("port argument should be numeric");
-    assert_ne!(port, 0, "{output:?}");
-    assert_eq!(arguments.get(3), Some(&"--strictPort"), "{output:?}");
-    assert_eq!(arguments.get(4), Some(&"test"), "{output:?}");
-    assert_eq!(arguments.get(5), Some(&"--watch"), "{output:?}");
-    assert_eq!(arguments.len(), 6, "{output:?}");
+    assert_eq!(
+        normalized_arguments(output),
+        [
+            "dev",
+            "--port",
+            "<port>",
+            "--strictPort",
+            "run",
+            "dev",
+            "--",
+            "--port",
+            "<port>",
+            "--strictPort",
+            "dev",
+            "--port",
+            "<port>",
+            "--strictPort",
+            "test",
+            "--watch",
+        ]
+    );
 }
 
 fn write_package(repository: &TestRepository, contents: &str) {
@@ -382,8 +530,121 @@ fn move_worktree(repository: &TestRepository, path: &Path, name: &str) -> PathBu
 }
 
 fn bun(directory: &Path, arguments: &[&str]) -> Output {
-    let bun = FakeBun::printing();
+    let bun = FakeCommand::printing("bun");
     run_bun(directory, bun.path(), arguments)
+}
+
+fn package_runner(directory: &Path, command: &str, arguments: &[&str]) -> Output {
+    let executable = FakeCommand::printing(command);
+    ragavan_command(directory)
+        .arg("__run")
+        .arg(command)
+        .arg(executable.path())
+        .args(arguments)
+        .output()
+        .expect("Ragavan should run the package manager")
+}
+
+fn normalized_arguments(output: Output) -> Vec<String> {
+    assert_success(&output);
+    assert_eq!(stderr(&output), "", "{output:?}");
+
+    let mut arguments: Vec<_> = stdout(&output).lines().map(str::to_owned).collect();
+    let mut ports = 0;
+    for index in 1..arguments.len() {
+        if arguments[index - 1] != "--port" {
+            continue;
+        }
+        let port: u16 = arguments[index]
+            .parse()
+            .expect("Vite's port should be numeric");
+        assert_ne!(port, 0);
+        arguments[index] = "<port>".to_owned();
+        ports += 1;
+    }
+    assert_ne!(ports, 0, "Vite should receive a port");
+    arguments
+}
+
+struct FakeCommand {
+    _directory: TempDirectory,
+    path: PathBuf,
+}
+
+impl FakeCommand {
+    fn printing(name: &str) -> Self {
+        #[cfg(windows)]
+        let (name, contents) = (
+            format!("{name}.cmd"),
+            b"@echo off\r\nfor %%A in (%*) do @echo %%~A\r\n".as_slice(),
+        );
+        #[cfg(not(windows))]
+        let (name, contents) = (
+            name.to_owned(),
+            b"#!/bin/sh\nfor argument do printf '%s\\n' \"$argument\"; done\n".as_slice(),
+        );
+
+        Self::create(&name, contents)
+    }
+
+    fn exiting(name: &str, code: u8) -> Self {
+        #[cfg(windows)]
+        let contents = format!("@echo off\r\nexit /b {code}\r\n");
+        #[cfg(not(windows))]
+        let contents = format!("#!/bin/sh\nexit {code}\n");
+
+        Self::create(&command_file_name(name), contents.as_bytes())
+    }
+
+    fn waiting(name: &str) -> Self {
+        #[cfg(windows)]
+        let contents = concat!(
+            "@echo off\r\n",
+            "for %%A in (%*) do @echo %%~A\r\n",
+            "set /p _ragavan_release=\r\n",
+        );
+        #[cfg(not(windows))]
+        let contents = concat!(
+            "#!/bin/sh\n",
+            "for argument do printf '%s\\n' \"$argument\"; done\n",
+            "IFS= read -r _ragavan_release\n",
+        );
+
+        Self::create(&command_file_name(name), contents.as_bytes())
+    }
+
+    fn create(name: &str, contents: &[u8]) -> Self {
+        let directory = TempDirectory::new();
+        let path = directory.path().join(name);
+        fs::write(&path, contents).expect("fake command should be written");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&path)
+                .expect("fake command should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("fake command should be executable");
+        }
+
+        Self {
+            _directory: directory,
+            path,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn command_file_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.cmd")
+    } else {
+        name.to_owned()
+    }
 }
 
 fn run_bun(directory: &Path, bun: &Path, arguments: &[&str]) -> Output {
@@ -455,83 +716,4 @@ fn development_port(directory: &Path) -> u16 {
     assert_eq!(arguments.get(3).map(String::as_str), Some("--strictPort"));
     assert_eq!(arguments.len(), 4);
     arguments[2].parse().expect("port should be numeric")
-}
-
-struct FakeBun {
-    _directory: TempDirectory,
-    path: PathBuf,
-}
-
-impl FakeBun {
-    fn printing() -> Self {
-        #[cfg(windows)]
-        let (name, contents) = (
-            "bun.cmd",
-            b"@echo off\r\nfor %%A in (%*) do @echo %%~A\r\n".as_slice(),
-        );
-        #[cfg(not(windows))]
-        let (name, contents) = (
-            "bun",
-            b"#!/bin/sh\nfor argument do printf '%s\\n' \"$argument\"; done\n".as_slice(),
-        );
-
-        Self::create(name, contents)
-    }
-
-    fn exiting(code: u8) -> Self {
-        #[cfg(windows)]
-        let contents = format!("@echo off\r\nexit /b {code}\r\n");
-        #[cfg(not(windows))]
-        let contents = format!("#!/bin/sh\nexit {code}\n");
-
-        Self::create(
-            if cfg!(windows) { "bun.cmd" } else { "bun" },
-            contents.as_bytes(),
-        )
-    }
-
-    fn waiting() -> Self {
-        #[cfg(windows)]
-        let contents = concat!(
-            "@echo off\r\n",
-            "for %%A in (%*) do @echo %%~A\r\n",
-            "set /p _ragavan_release=\r\n",
-        );
-        #[cfg(not(windows))]
-        let contents = concat!(
-            "#!/bin/sh\n",
-            "for argument do printf '%s\\n' \"$argument\"; done\n",
-            "IFS= read -r _ragavan_release\n",
-        );
-
-        Self::create(
-            if cfg!(windows) { "bun.cmd" } else { "bun" },
-            contents.as_bytes(),
-        )
-    }
-
-    fn create(name: &str, contents: &[u8]) -> Self {
-        let directory = TempDirectory::new();
-        let path = directory.path().join(name);
-        fs::write(&path, contents).expect("fake Bun should be written");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&path)
-                .expect("fake Bun should exist")
-                .permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&path, permissions).expect("fake Bun should be executable");
-        }
-
-        Self {
-            _directory: directory,
-            path,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
 }

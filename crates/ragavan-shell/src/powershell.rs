@@ -19,7 +19,7 @@ $global:__RagavanCommand = Get-Command ragavan -CommandType Application -ErrorAc
 "#;
 
 const POWERSHELL_COMMAND_HOOK: &str = r#"
-$global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'] = Get-Command '__RAGAVAN_COMMAND__' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+$global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'] = Get-Command '__RAGAVAN_COMMAND__' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -ne $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__']) {
     function global:__RAGAVAN_COMMAND__ {
         & $global:__RagavanCommand __RAGAVAN_RUN_COMMAND__ '__RAGAVAN_COMMAND__' $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'].Path @args
