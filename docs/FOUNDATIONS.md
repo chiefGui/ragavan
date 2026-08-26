@@ -35,9 +35,12 @@ need Ragavan-specific configuration or application changes.
 ## Scope
 
 - A **repository** is the single enrollment boundary shared by its worktrees.
-- A **worktree** is the isolation boundary and has an identity independent of its
-  current branch or path.
-- Every allocated resource has one explicit owner and cleanup lifecycle.
+- A **worktree** is an environment boundary and has an identity independent of
+  its current branch or path.
+- A **service** is an independently running development target within a
+  worktree.
+- Every allocated resource belongs to one service and has one explicit cleanup
+  lifecycle.
 
 Stack-specific support may describe required launch adjustments, but it does not
 own process execution, terminal behavior, resource allocation, or cleanup.

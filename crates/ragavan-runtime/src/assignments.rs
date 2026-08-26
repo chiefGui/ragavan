@@ -1,5 +1,5 @@
 use super::{Error, PORT_RANGE_SIZE, PORT_RANGE_START};
-use ragavan_core::WorktreeIdentity;
+use ragavan_core::ServiceIdentity;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -60,7 +60,7 @@ impl PortAssignments {
         Ok(Self { path, entries })
     }
 
-    pub(super) fn assignment(&self, identity: &WorktreeIdentity) -> Result<Assignment, Error> {
+    pub(super) fn assignment(&self, identity: &ServiceIdentity) -> Result<Assignment, Error> {
         if let Some((slot, port)) = self.entries.get(&key(identity)).copied() {
             return Ok(Assignment {
                 slot,
@@ -77,14 +77,14 @@ impl PortAssignments {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidAssignments {
                 path: self.path.clone(),
-                detail: "the worktree slot counter is exhausted".to_owned(),
+                detail: "the service slot counter is exhausted".to_owned(),
             })?;
         Ok(Assignment { slot, port: None })
     }
 
     pub(super) fn remember(
         &mut self,
-        identity: &WorktreeIdentity,
+        identity: &ServiceIdentity,
         assignment: Assignment,
         port: u16,
     ) -> Result<(), Error> {
@@ -119,12 +119,18 @@ impl PortAssignments {
     }
 }
 
-fn key(identity: &WorktreeIdentity) -> String {
+fn key(identity: &ServiceIdentity) -> String {
+    let worktree = identity.worktree();
+    let scope = identity.scope().unwrap_or_default();
+
     format!(
-        "{}:{}{}",
-        identity.repository_id().len(),
-        identity.repository_id(),
-        identity.worktree_id()
+        "s:{}:{}{}:{}{}:{}",
+        worktree.repository_id().len(),
+        worktree.repository_id(),
+        worktree.worktree_id().len(),
+        worktree.worktree_id(),
+        scope.len(),
+        scope
     )
 }
 
@@ -134,13 +140,13 @@ fn validate(path: &Path, entries: &Entries) -> Result<(), Error> {
         if *slot == 0 {
             return Err(Error::InvalidAssignments {
                 path: path.to_owned(),
-                detail: "a worktree has slot zero".to_owned(),
+                detail: "a service has slot zero".to_owned(),
             });
         }
         if !slots.insert(*slot) {
             return Err(Error::InvalidAssignments {
                 path: path.to_owned(),
-                detail: format!("worktree slot {slot} is assigned more than once"),
+                detail: format!("service slot {slot} is assigned more than once"),
             });
         }
         if !(PORT_RANGE_START..PORT_RANGE_START + PORT_RANGE_SIZE).contains(port) {

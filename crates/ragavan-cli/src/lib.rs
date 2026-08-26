@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use ragavan_core::{Enrollment, LaunchPlan};
+use ragavan_core::{Enrollment, LaunchPlan, ServiceIdentity};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -330,7 +330,7 @@ fn isolate_command(
         return Ok(None);
     };
     let adjustment = development_command.resolve(worktree.root())?;
-    let identity = worktree.identity()?;
+    let identity = ServiceIdentity::root(worktree.identity()?);
     let lease = ragavan_runtime::acquire_port(&identity)?;
     let plan = adjustment.launch_plan(lease.port());
 

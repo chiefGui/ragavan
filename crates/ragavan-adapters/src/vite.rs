@@ -52,7 +52,7 @@ impl fmt::Display for Error {
         match self {
             Self::ExplicitPort { invocation } => write!(
                 formatter,
-                "could not isolate `{invocation}`: an explicit `--port` conflicts with Ragavan's worktree port",
+                "could not isolate `{invocation}`: an explicit `--port` conflicts with Ragavan's managed port",
             ),
         }
     }
