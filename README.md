@@ -5,7 +5,7 @@ environments without changing the commands developers already use.
 
 > [!NOTE]
 > Ragavan is in early development. The current vertical slice supports
-> PowerShell, Bun, and simple Vite development scripts. It is a product proof,
+> PowerShell, Bun, Vite, and Vite+ development scripts. It is a product proof,
 > not broad stack support yet.
 
 The project's durable product and architectural constraints live in
@@ -63,13 +63,20 @@ ragavan enable
 bun dev
 ```
 
-For a package with a simple Vite script such as `"dev": "vite"`, Ragavan adds a
-stable worktree-specific port and requires Vite to use it. Before Bun starts,
-Ragavan skips occupied ports and coordinates simultaneous worktrees. It retains
-the assignment across restarts and holds its lease until Bun stops, including
-when the terminal interrupts the process. `bun run dev` works as well. Every
-other Bun command passes through unchanged, as do Bun commands outside enabled
-repositories.
+For a package whose `dev` script ends in Vite (`vite`) or Vite+ (`vp dev`),
+Ragavan adds a stable worktree-specific port and requires the development server
+to use it. Ordinary setup commands may precede the server in an `&&` chain, such
+as `"dev": "bun run build:ipc:development && vp dev"`. Static environment
+assignments and quoted command paths are supported as well.
+
+Ragavan validates the script structure before Bun starts. Pipelines, background
+jobs, dynamic shell expansion, multiple recognized development-server
+invocations, and scripts where the server is not the final command fail clearly
+instead of running without isolation. Ragavan then skips occupied ports and
+coordinates simultaneous worktrees. It retains the assignment across restarts
+and holds its lease until Bun stops, including when the terminal interrupts the
+process. `bun run dev` works as well. Every other Bun command passes through
+unchanged, as do Bun commands outside enabled repositories.
 
 Ragavan keeps port assignments and process-scoped locks in the user's local
 application-state directory. It never writes them into the repository, and no
@@ -117,10 +124,12 @@ layers:
 The CLI library composes the capability crates and the executable only supplies
 its process arguments. Git, runtime, adapters, and shell do not depend on each
 other; shared domain values flow through `ragavan-core`.
-Inside `ragavan-adapters`, command runners such as Bun resolve package scripts
-into a runner-neutral representation consumed by stack adapters such as Vite.
-The runner and stack registries are the only variant composition points; shell,
-CLI, and runtime code remain independent of individual tools.
+Inside `ragavan-adapters`, shared manifest discovery reads `package.json`, while
+command runners such as Bun own invocation and argument-forwarding semantics.
+They resolve package scripts into a structured, runner-neutral representation
+consumed by independent stack adapters such as Vite and Vite+. The runner and
+stack registries are the only variant composition points; shell, CLI, and
+runtime code remain independent of individual tools.
 
 ## Development
 

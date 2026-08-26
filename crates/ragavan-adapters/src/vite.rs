@@ -1,6 +1,34 @@
-use crate::{Error as AdapterError, ResolvedScript, StackAdjustment};
+use crate::{Error as AdapterError, Invocation, Stack, StackAdjustment};
 use ragavan_core::Port;
 use std::{ffi::OsString, fmt};
+
+pub(super) const ADAPTER: Stack = Stack { recognize, adjust };
+
+fn recognize(invocation: &Invocation) -> bool {
+    invocation.invokes("vite")
+}
+
+pub(super) fn adjust(
+    invocation: &Invocation,
+    forwarded_arguments: &[OsString],
+    runner_invocation: &'static str,
+) -> Result<StackAdjustment, AdapterError> {
+    if invocation
+        .arguments()
+        .iter()
+        .any(|argument| is_port_argument(argument))
+        || forwarded_arguments
+            .iter()
+            .filter_map(|argument| argument.to_str())
+            .any(is_port_argument)
+    {
+        return Err(AdapterError::stack(Error::ExplicitPort {
+            invocation: runner_invocation,
+        }));
+    }
+
+    Ok(StackAdjustment { port_arguments })
+}
 
 fn port_arguments(port: Port) -> Vec<String> {
     vec![
@@ -10,60 +38,12 @@ fn port_arguments(port: Port) -> Vec<String> {
     ]
 }
 
-fn reject_explicit_port(arguments: &[OsString], invocation: &'static str) -> Result<(), Error> {
-    if arguments
-        .iter()
-        .filter_map(|argument| argument.to_str())
-        .any(is_port_argument)
-    {
-        Err(Error::ExplicitPort { invocation })
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn recognize(
-    script: &ResolvedScript<'_>,
-) -> Result<Option<StackAdjustment>, AdapterError> {
-    if !is_supported_vite_script(script.command()) {
-        return Ok(None);
-    }
-    reject_explicit_port(script.arguments(), script.invocation()).map_err(AdapterError::stack)?;
-    if script
-        .command()
-        .split_ascii_whitespace()
-        .any(is_port_argument)
-    {
-        return Err(AdapterError::stack(Error::ExplicitPort {
-            invocation: script.invocation(),
-        }));
-    }
-
-    Ok(Some(StackAdjustment::new(port_arguments)))
-}
-
 fn is_port_argument(argument: &str) -> bool {
     argument == "--port" || argument.starts_with("--port=")
 }
 
-fn is_supported_vite_script(script: &str) -> bool {
-    if script
-        .chars()
-        .any(|character| "\r\n&|;<>".contains(character))
-    {
-        return false;
-    }
-
-    let Some(command) = script.split_ascii_whitespace().next() else {
-        return false;
-    };
-    let command = command.rsplit(['/', '\\']).next().unwrap_or(command);
-
-    matches!(command, "vite" | "vite.cmd" | "vite.exe")
-}
-
 #[derive(Debug)]
-pub(crate) enum Error {
+enum Error {
     ExplicitPort { invocation: &'static str },
 }
 

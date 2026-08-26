@@ -1,18 +1,20 @@
-use crate::{Error as AdapterError, ResolvedScript};
+use crate::{Error as AdapterError, ResolvedScript, Runner, package_json, script::Script};
 use std::{
-    env,
     ffi::OsString,
-    fmt, fs, io,
+    fmt,
     path::{Path, PathBuf},
 };
 
-pub(super) const COMMAND: &str = "bun";
+pub(super) const ADAPTER: Runner = Runner {
+    command: "bun",
+    resolve,
+};
 
 fn forward_script_arguments(arguments: Vec<String>) -> Vec<String> {
     arguments
 }
 
-pub(super) fn resolve<'a>(
+fn resolve<'a>(
     arguments: &'a [OsString],
     worktree_root: &Path,
 ) -> Result<Option<ResolvedScript<'a>>, AdapterError> {
@@ -51,145 +53,59 @@ impl<'a> BunDev<'a> {
     }
 
     fn resolve(self, worktree_root: &Path) -> Result<ResolvedScript<'a>, Error> {
-        let package_path = nearest_package_json(worktree_root)?;
-        let package = fs::read(&package_path).map_err(|source| Error::ReadPackage {
-            path: package_path.clone(),
-            source,
-        })?;
-        let package: serde_json::Value =
-            serde_json::from_slice(&package).map_err(|source| Error::ParsePackage {
-                path: package_path.clone(),
-                source,
-            })?;
-        let command = package
-            .get("scripts")
-            .and_then(|scripts| scripts.get("dev"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::MissingDevScript {
-                path: package_path.clone(),
-            })?
-            .to_owned();
+        let package_script =
+            package_json::find_script(worktree_root, "dev").map_err(Error::Package)?;
+        let (package_path, source) = package_script.into_parts();
+        let script = match Script::parse(&source) {
+            Ok(script) => script,
+            Err(error) => {
+                return Err(Error::UnsupportedSyntax {
+                    path: package_path,
+                    script: source,
+                    source: error,
+                });
+            }
+        };
+        let argument_sink = script
+            .invocations()
+            .len()
+            .checked_sub(1)
+            .expect("validated scripts contain an invocation");
 
         Ok(ResolvedScript {
             invocation: "bun dev",
             package_path,
-            command,
+            source,
+            script,
+            argument_sink,
             arguments: self.script_arguments(),
             forward_script_arguments,
         })
     }
 }
 
-fn nearest_package_json(worktree_root: &Path) -> Result<PathBuf, Error> {
-    let current_directory = env::current_dir().map_err(Error::CurrentDirectory)?;
-    let resolved_current_directory =
-        fs::canonicalize(&current_directory).map_err(|source| Error::ResolveDirectory {
-            path: current_directory.clone(),
-            source,
-        })?;
-    let resolved_worktree_root =
-        fs::canonicalize(worktree_root).map_err(|source| Error::ResolveDirectory {
-            path: worktree_root.to_owned(),
-            source,
-        })?;
-
-    if !resolved_current_directory.starts_with(&resolved_worktree_root) {
-        return Err(Error::CurrentDirectoryOutsideWorktree {
-            current_directory,
-            root: worktree_root.to_owned(),
-        });
-    }
-
-    for directory in resolved_current_directory.ancestors() {
-        let package_path = directory.join("package.json");
-        match fs::metadata(&package_path) {
-            Ok(metadata) if metadata.is_file() => return Ok(package_path),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(Error::ReadPackage {
-                    path: package_path,
-                    source,
-                });
-            }
-        }
-
-        if directory == resolved_worktree_root {
-            return Err(Error::MissingPackage {
-                root: worktree_root.to_owned(),
-            });
-        }
-    }
-
-    Err(Error::CurrentDirectoryOutsideWorktree {
-        current_directory,
-        root: worktree_root.to_owned(),
-    })
-}
-
 #[derive(Debug)]
-pub(crate) enum Error {
-    CurrentDirectory(io::Error),
-    ResolveDirectory {
+enum Error {
+    Package(package_json::Error),
+    UnsupportedSyntax {
         path: PathBuf,
-        source: io::Error,
-    },
-    CurrentDirectoryOutsideWorktree {
-        current_directory: PathBuf,
-        root: PathBuf,
-    },
-    MissingPackage {
-        root: PathBuf,
-    },
-    ReadPackage {
-        path: PathBuf,
-        source: io::Error,
-    },
-    ParsePackage {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    MissingDevScript {
-        path: PathBuf,
+        script: String,
+        source: crate::script::Error,
     },
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "could not isolate `bun dev`: ")?;
         match self {
-            Self::CurrentDirectory(source) => {
-                write!(formatter, "could not read the current directory: {source}")
-            }
-            Self::ResolveDirectory { path, source } => {
-                write!(
-                    formatter,
-                    "could not resolve directory {}: {source}",
-                    path.display()
-                )
-            }
-            Self::CurrentDirectoryOutsideWorktree {
-                current_directory,
-                root,
+            Self::Package(source) => source.fmt(formatter),
+            Self::UnsupportedSyntax {
+                path,
+                script,
+                source,
             } => write!(
                 formatter,
-                "current directory {} is outside Git worktree {}",
-                current_directory.display(),
-                root.display()
-            ),
-            Self::MissingPackage { root } => write!(
-                formatter,
-                "could not isolate `bun dev`: no package.json exists between the current directory and {}",
-                root.display()
-            ),
-            Self::ReadPackage { path, source } => {
-                write!(formatter, "could not read {}: {source}", path.display())
-            }
-            Self::ParsePackage { path, source } => {
-                write!(formatter, "could not parse {}: {source}", path.display())
-            }
-            Self::MissingDevScript { path } => write!(
-                formatter,
-                "could not isolate `bun dev`: {} has no string `scripts.dev`",
+                "{} uses unsupported script {script:?}: {source}",
                 path.display()
             ),
         }
@@ -199,11 +115,8 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CurrentDirectory(source) => Some(source),
-            Self::ResolveDirectory { source, .. } => Some(source),
-            Self::ReadPackage { source, .. } => Some(source),
-            Self::ParsePackage { source, .. } => Some(source),
-            _ => None,
+            Self::Package(source) => Some(source),
+            Self::UnsupportedSyntax { source, .. } => Some(source),
         }
     }
 }

@@ -37,15 +37,15 @@ fn vite_ports_are_stable_and_distinct_across_worktrees() {
     );
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
 
-    let main_port = vite_port(repository.path());
-    assert_eq!(vite_port(repository.path()), main_port);
+    let main_port = development_port(repository.path());
+    assert_eq!(development_port(repository.path()), main_port);
 
     let linked_worktree = repository.add_worktree("linked");
-    let linked_port = vite_port(&linked_worktree);
+    let linked_port = development_port(&linked_worktree);
     assert_ne!(linked_port, main_port);
 
     let moved_worktree = move_worktree(&repository, &linked_worktree, "moved");
-    assert_eq!(vite_port(&moved_worktree), linked_port);
+    assert_eq!(development_port(&moved_worktree), linked_port);
 
     for worktree in [repository.path(), &moved_worktree] {
         assert_stdout(git(worktree, &["status", "--porcelain"]), "");
@@ -58,14 +58,14 @@ fn occupied_vite_ports_are_reassigned_and_remain_stable() {
     write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
 
-    let preferred = vite_port(repository.path());
+    let preferred = development_port(repository.path());
     let occupied = TcpListener::bind(("localhost", preferred))
         .expect("the preferred port should be available after Bun stops");
-    let reassigned = vite_port(repository.path());
+    let reassigned = development_port(repository.path());
     assert_ne!(reassigned, preferred);
     drop(occupied);
 
-    assert_eq!(vite_port(repository.path()), reassigned);
+    assert_eq!(development_port(repository.path()), reassigned);
     assert_stdout(git(repository.path(), &["status", "--porcelain"]), "");
 }
 
@@ -87,8 +87,35 @@ fn supervised_worktrees_own_distinct_stable_ports_until_exit() {
 
     stop_bun(main_process);
     stop_bun(linked_process);
-    assert_eq!(vite_port(repository.path()), main_port);
-    assert_eq!(vite_port(&linked_worktree), linked_port);
+    assert_eq!(development_port(repository.path()), main_port);
+    assert_eq!(development_port(&linked_worktree), linked_port);
+}
+
+#[test]
+fn vite_plus_after_setup_commands_receives_the_worktree_port() {
+    let repository = TestRepository::new();
+    write_package(
+        &repository,
+        r#"{"scripts":{"dev":"bun run build:ipc:development && vp dev"}}"#,
+    );
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let port = development_port(repository.path());
+    assert_eq!(development_port(repository.path()), port);
+    assert_stdout(git(repository.path(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn static_environment_assignments_and_quoted_paths_are_supported() {
+    let repository = TestRepository::new();
+    write_package(
+        &repository,
+        r#"{"scripts":{"dev":"NODE_ENV='development mode' './node_modules/.bin/vite'"}}"#,
+    );
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let port = development_port(repository.path());
+    assert_eq!(development_port(repository.path()), port);
 }
 
 #[test]
@@ -152,6 +179,72 @@ fn explicit_vite_ports_are_rejected_instead_of_overridden() {
     let output = bun(repository.path(), &["run", "dev", "--port", "4567"]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(stderr(&output).contains("explicit `--port`"));
+}
+
+#[test]
+fn explicit_vite_plus_ports_in_package_scripts_are_rejected() {
+    let repository = TestRepository::new();
+    write_package(
+        &repository,
+        r#"{"scripts":{"dev":"bun run prepare && vp dev --port=4567"}}"#,
+    );
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let output = bun(repository.path(), &["dev"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).contains("explicit `--port`"), "{output:?}");
+}
+
+#[test]
+fn unsupported_shell_syntax_fails_closed() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vp dev | worker"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    for script in [
+        "vp dev | worker",
+        "vp dev || worker",
+        "vp dev & worker",
+        "vp dev; worker",
+        "$(vp dev)",
+        "vp dev # comment",
+        "vp dev\nworker",
+    ] {
+        replace_package_script(repository.path(), script);
+        let output = bun(repository.path(), &["dev"]);
+        assert_eq!(output.status.code(), Some(1), "{script}: {output:?}");
+        let error = stderr(&output);
+        assert!(error.contains("unsupported script"), "{script}: {output:?}");
+        assert_eq!(error.lines().count(), 1, "{script}: {output:?}");
+    }
+}
+
+#[test]
+fn development_server_must_be_the_runner_argument_sink() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vp dev && echo done"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let output = bun(repository.path(), &["dev"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stderr(&output).contains("development server must be the final command"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn multiple_recognized_development_servers_are_rejected() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vite && vp dev"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let output = bun(repository.path(), &["dev"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stderr(&output).contains("more than one recognized development server"),
+        "{output:?}"
+    );
 }
 
 #[test]
@@ -265,6 +358,12 @@ fn write_package(repository: &TestRepository, contents: &str) {
     assert_success(&git(repository.path(), &["commit", "-m", "add package"]));
 }
 
+fn replace_package_script(repository: &Path, script: &str) {
+    let package = serde_json::json!({ "scripts": { "dev": script } });
+    fs::write(repository.join("package.json"), package.to_string())
+        .expect("package.json should be replaced");
+}
+
 fn move_worktree(repository: &TestRepository, path: &Path, name: &str) -> PathBuf {
     let destination = repository
         .path()
@@ -345,7 +444,7 @@ fn assert_bun_arguments(output: Output, expected: &[&str]) {
     assert_eq!(stdout(&output).lines().collect::<Vec<_>>(), expected);
 }
 
-fn vite_port(directory: &Path) -> u16 {
+fn development_port(directory: &Path) -> u16 {
     let output = bun(directory, &["dev"]);
     assert_success(&output);
     assert_eq!(stderr(&output), "", "{output:?}");
