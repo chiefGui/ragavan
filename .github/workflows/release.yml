@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild and resubmit during moderation
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -20,13 +26,16 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install pinned Rust toolchain
         run: rustup show
 
       - name: Verify release version
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           $packages = @($metadata.packages | Where-Object { $_.name -eq 'ragavan' })
@@ -36,11 +45,33 @@ jobs:
 
           $version = [string] $packages[0].version
           $expectedTag = "v$version"
-          if ($env:GITHUB_REF_NAME -cne $expectedTag) {
-              throw "Release tag '$env:GITHUB_REF_NAME' must match Cargo version '$expectedTag'."
+          $releaseTag = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+              $env:REQUESTED_RELEASE_TAG
+          }
+          else {
+              $env:GITHUB_REF_NAME
+          }
+
+          if ($releaseTag -cne $expectedTag) {
+              throw "Release tag '$releaseTag' must match Cargo version '$expectedTag'."
+          }
+
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+              gh release view $releaseTag | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Manual resubmission requires an existing GitHub release for '$releaseTag'."
+              }
           }
 
           "RAGAVAN_VERSION=$version" >> $env:GITHUB_ENV
+          "RAGAVAN_RELEASE_TAG=$releaseTag" >> $env:GITHUB_ENV
+          $sourceReference = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+              $env:GITHUB_SHA
+          }
+          else {
+              $releaseTag
+          }
+          "RAGAVAN_SOURCE_REFERENCE=$sourceReference" >> $env:GITHUB_ENV
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -53,9 +84,12 @@ jobs:
 
       - name: Build release artifacts
         shell: pwsh
-        run: .\packaging\chocolatey\pack.ps1 -Version $env:RAGAVAN_VERSION
+        run: |
+          .\packaging\chocolatey\pack.ps1 `
+              -Version $env:RAGAVAN_VERSION `
+              -SourceReference $env:RAGAVAN_SOURCE_REFERENCE
 
-      - name: Create GitHub release
+      - name: Publish GitHub release assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -66,10 +100,24 @@ jobs:
               "target\distribution\ragavan.$env:RAGAVAN_VERSION.nupkg"
           )
 
-          gh release create $env:GITHUB_REF_NAME $artifacts `
-              --verify-tag `
-              --generate-notes `
-              --title "Ragavan $env:GITHUB_REF_NAME"
+          gh release view $env:RAGAVAN_RELEASE_TAG 2>$null | Out-Null
+          $releaseExists = $LASTEXITCODE -eq 0
+
+          if ($releaseExists) {
+              gh release upload $env:RAGAVAN_RELEASE_TAG $artifacts --clobber
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Could not replace assets for '$env:RAGAVAN_RELEASE_TAG'."
+              }
+          }
+          else {
+              gh release create $env:RAGAVAN_RELEASE_TAG $artifacts `
+                  --verify-tag `
+                  --generate-notes `
+                  --title "Ragavan $env:RAGAVAN_RELEASE_TAG"
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Could not create release '$env:RAGAVAN_RELEASE_TAG'."
+              }
+          }
 
       - name: Publish Chocolatey package
         shell: pwsh

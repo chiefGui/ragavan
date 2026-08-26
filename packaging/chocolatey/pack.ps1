@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string] $Version
+    [string] $Version,
+
+    [Parameter()]
+    [string] $SourceReference
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +34,27 @@ function Write-Utf8File {
     [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
+function Find-DumpBin {
+    $command = Get-Command 'dumpbin.exe' -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+
+    $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+    $vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+        $candidates = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe')
+        if ($LASTEXITCODE -eq 0) {
+            $candidate = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if ($candidate) {
+                return $candidate
+            }
+        }
+    }
+
+    throw 'Could not find dumpbin.exe to verify the release binary dependencies.'
+}
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $targetDirectory = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'target'))
 $distributionDirectory = [System.IO.Path]::GetFullPath((Join-Path $targetDirectory 'distribution'))
@@ -56,12 +80,30 @@ try {
         throw "Requested version '$Version' does not match Cargo version '$packageVersion'."
     }
 
+    $resolvedSourceReference = if ($SourceReference) {
+        $SourceReference
+    }
+    else {
+        "v$packageVersion"
+    }
+    if ($resolvedSourceReference -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]*$') {
+        throw "Source reference '$resolvedSourceReference' contains unsupported characters."
+    }
+
     & cargo build --locked --release --package ragavan
     Assert-LastExitCode 'Building Ragavan'
 
     $builtExecutable = Join-Path ([string] $metadata.target_directory) 'release\ragavan.exe'
     if (-not (Test-Path -LiteralPath $builtExecutable -PathType Leaf)) {
         throw "Built executable was not found at '$builtExecutable'."
+    }
+
+    $dumpbin = Find-DumpBin
+    $dependencies = & $dumpbin /nologo /dependents $builtExecutable
+    Assert-LastExitCode 'Inspecting Ragavan dependencies'
+    $externalRuntime = $dependencies | Select-String -Pattern '(?i)\b(?:vcruntime\d*|msvcp\d*|ucrtbase|api-ms-win-crt-[^\s]+)\.dll\b'
+    if ($externalRuntime) {
+        throw "Ragavan must statically link the Microsoft C runtime; found $($externalRuntime.Matches.Value -join ', ')."
     }
 
     if (Test-Path -LiteralPath $distributionDirectory) {
@@ -85,7 +127,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE') -Destination (Join-Path $stageToolsDirectory 'LICENSE.txt')
 
     $verificationTemplate = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'VERIFICATION.txt.in')
-    $verification = $verificationTemplate.Replace('{{VERSION}}', $packageVersion).Replace('{{SHA256}}', $checksum)
+    $verification = $verificationTemplate.Replace('{{SOURCE_REFERENCE}}', $resolvedSourceReference).Replace('{{SHA256}}', $checksum)
     Write-Utf8File -Path (Join-Path $stageToolsDirectory 'VERIFICATION.txt') -Content $verification
 
     $nuspec = Join-Path $stageDirectory 'ragavan.nuspec'

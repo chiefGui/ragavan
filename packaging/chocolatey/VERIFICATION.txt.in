@@ -1,14 +1,15 @@
 VERIFICATION
 
-The packaged ragavan.exe was built from the source tagged at:
-https://github.com/chiefGui/ragavan/tree/v{{VERSION}}
+The packaged ragavan.exe was built from the source reference at:
+https://github.com/chiefGui/ragavan/tree/{{SOURCE_REFERENCE}}
 
 Build command:
 cargo build --locked --release --package ragavan
 
-The repository pins the Rust toolchain used for the build in
-rust-toolchain.toml. To verify the packaged executable, build that tag with the
-command above and compare the SHA-256 checksum.
+The repository pins the Rust toolchain in rust-toolchain.toml and statically
+links the Microsoft C runtime through .cargo/config.toml. To verify the packaged
+executable, build that source reference with the command above and compare the
+SHA-256 checksum.
 
 Packaged ragavan.exe SHA-256:
 {{SHA256}}
