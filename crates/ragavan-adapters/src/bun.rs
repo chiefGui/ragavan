@@ -1,4 +1,4 @@
-use crate::ResolvedScript;
+use crate::{Error as AdapterError, ResolvedScript};
 use std::{
     env,
     ffi::OsString,
@@ -6,13 +6,34 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub struct BunDev<'a> {
+pub(super) const COMMAND: &str = "bun";
+
+fn forward_script_arguments(arguments: Vec<String>) -> Vec<String> {
+    arguments
+}
+
+pub(super) fn resolve<'a>(
+    arguments: &'a [OsString],
+    worktree_root: &Path,
+) -> Result<Option<ResolvedScript<'a>>, AdapterError> {
+    let Some(bun_dev) = BunDev::recognize(arguments) else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        bun_dev
+            .resolve(worktree_root)
+            .map_err(AdapterError::runner)?,
+    ))
+}
+
+struct BunDev<'a> {
     arguments: &'a [OsString],
     script_index: usize,
 }
 
 impl<'a> BunDev<'a> {
-    pub fn recognize(arguments: &'a [OsString]) -> Option<Self> {
+    fn recognize(arguments: &'a [OsString]) -> Option<Self> {
         let script_index = match arguments {
             [script, ..] if script == "dev" => 0,
             [run, script, ..] if run == "run" && script == "dev" => 1,
@@ -25,11 +46,11 @@ impl<'a> BunDev<'a> {
         })
     }
 
-    pub(crate) fn script_arguments(&self) -> &'a [OsString] {
+    fn script_arguments(&self) -> &'a [OsString] {
         &self.arguments[self.script_index + 1..]
     }
 
-    pub(crate) fn resolve(self, worktree_root: &Path) -> Result<ResolvedScript, Error> {
+    fn resolve(self, worktree_root: &Path) -> Result<ResolvedScript<'a>, Error> {
         let package_path = nearest_package_json(worktree_root)?;
         let package = fs::read(&package_path).map_err(|source| Error::ReadPackage {
             path: package_path.clone(),
@@ -50,8 +71,11 @@ impl<'a> BunDev<'a> {
             .to_owned();
 
         Ok(ResolvedScript {
+            invocation: "bun dev",
             package_path,
             command,
+            arguments: self.script_arguments(),
+            forward_script_arguments,
         })
     }
 }

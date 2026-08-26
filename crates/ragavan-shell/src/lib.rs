@@ -3,13 +3,63 @@
 mod powershell;
 
 use std::{
+    ffi::{OsStr, OsString},
     fmt,
     path::{Path, PathBuf},
 };
 
 pub mod protocol {
-    pub const BUN_ARGUMENTS_COMMAND: &str = "__bun-arguments";
-    pub const PASSTHROUGH_EXIT_CODE: u8 = 10;
+    use super::{OsStr, OsString};
+
+    pub const RUN_COMMAND: &str = "__run";
+    const OUTDATED_BUN_COMMAND: &str = "__bun-arguments";
+
+    pub struct RunRequest<'a> {
+        command: &'a OsStr,
+        executable: &'a OsStr,
+        arguments: &'a [OsString],
+    }
+
+    impl<'a> RunRequest<'a> {
+        pub fn command(&self) -> &'a OsStr {
+            self.command
+        }
+
+        pub fn executable(&self) -> &'a OsStr {
+            self.executable
+        }
+
+        pub fn arguments(&self) -> &'a [OsString] {
+            self.arguments
+        }
+    }
+
+    pub fn parse(arguments: &[OsString]) -> Result<Option<RunRequest<'_>>, &'static str> {
+        let Some((operation, arguments)) = arguments.split_first() else {
+            return Ok(None);
+        };
+        if operation == OUTDATED_BUN_COMMAND {
+            return Err(
+                "the loaded PowerShell integration is outdated; open a new PowerShell session or reload it with `Invoke-Expression (ragavan hook powershell | Out-String)`",
+            );
+        }
+        if operation != RUN_COMMAND {
+            return Ok(None);
+        }
+
+        match arguments {
+            [command, executable, arguments @ ..]
+                if !command.is_empty() && !executable.is_empty() =>
+            {
+                Ok(Some(RunRequest {
+                    command,
+                    executable,
+                    arguments,
+                }))
+            }
+            _ => Err("the loaded shell integration sent an incomplete command to Ragavan"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,8 +104,8 @@ pub fn uninstall(target: ShellTarget) -> Result<UninstallOutcome, Error> {
     resolve(target)?.uninstall().map_err(Error::powershell)
 }
 
-pub fn powershell_hook() -> String {
-    powershell::hook()
+pub fn powershell_hook<'a>(commands: impl IntoIterator<Item = &'a str>) -> String {
+    powershell::hook(commands)
 }
 
 fn resolve(target: ShellTarget) -> Result<powershell::PowerShell, Error> {

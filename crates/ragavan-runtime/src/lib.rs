@@ -1,14 +1,196 @@
 #![forbid(unsafe_code)]
 
+mod assignments;
+
+use self::assignments::PortAssignments;
 use ragavan_core::{Port, WorktreeIdentity};
+use std::{
+    env,
+    ffi::OsString,
+    fmt, fs,
+    fs::{File, OpenOptions, TryLockError},
+    io,
+    net::{TcpListener, ToSocketAddrs},
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus},
+};
 
 const PORT_RANGE_START: u16 = 10_000;
-const PORT_RANGE_SIZE: u64 = 20_000;
+const PORT_RANGE_SIZE: u16 = 20_000;
+const ALLOCATOR_LOCK_FILE: &str = "allocator.lock";
+const WORKTREE_LOCKS_DIRECTORY: &str = "worktrees";
+const PORT_LOCKS_DIRECTORY: &str = "ports";
 
-pub fn port_for(identity: &WorktreeIdentity) -> Port {
-    let repository_slot = stable_hash(identity.repository_id()) % PORT_RANGE_SIZE;
-    let worktree_slot = stable_hash(identity.worktree_id()) % PORT_RANGE_SIZE;
-    let value = PORT_RANGE_START + ((repository_slot + worktree_slot) % PORT_RANGE_SIZE) as u16;
+/// An exclusive worktree port held for the lifetime of a development process.
+pub struct PortLease {
+    port: Port,
+    worktree_lock: File,
+    port_lock: File,
+    reservations: Vec<TcpListener>,
+}
+
+impl PortLease {
+    pub fn port(&self) -> Port {
+        self.port
+    }
+
+    /// Release the socket reservation immediately before starting the process,
+    /// then retain both allocation locks until the process has stopped.
+    pub fn run(self, command: &mut Command) -> Result<ExitStatus, Error> {
+        let executable = command.get_program().to_owned();
+        let Self {
+            port: _,
+            worktree_lock,
+            port_lock,
+            reservations,
+        } = self;
+
+        drop(reservations);
+        let result = command
+            .status()
+            .map_err(|source| Error::RunProcess { executable, source });
+        drop(port_lock);
+        drop(worktree_lock);
+        result
+    }
+}
+
+/// Acquire the stable available port for one worktree.
+pub fn acquire_port(identity: &WorktreeIdentity) -> Result<PortLease, Error> {
+    acquire_port_in(&state_directory()?, identity)
+}
+
+fn acquire_port_in(
+    state_directory: &Path,
+    identity: &WorktreeIdentity,
+) -> Result<PortLease, Error> {
+    let worktree_locks = state_directory.join(WORKTREE_LOCKS_DIRECTORY);
+    let port_locks = state_directory.join(PORT_LOCKS_DIRECTORY);
+    for directory in [state_directory, &worktree_locks, &port_locks] {
+        fs::create_dir_all(directory).map_err(|source| Error::CreateState {
+            path: directory.to_owned(),
+            source,
+        })?;
+    }
+
+    let allocator_lock_path = state_directory.join(ALLOCATOR_LOCK_FILE);
+    let allocator_lock = open_lock(&allocator_lock_path)?;
+    allocator_lock
+        .lock()
+        .map_err(|source| Error::LockAllocator {
+            path: allocator_lock_path,
+            source,
+        })?;
+
+    let mut assignments = PortAssignments::read(state_directory)?;
+    let assignment = assignments.assignment(identity)?;
+
+    let worktree_lock_path = worktree_locks.join(format!("{}.lock", assignment.slot()));
+    let worktree_lock = open_lock(&worktree_lock_path)?;
+    match worktree_lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Err(Error::WorktreeAlreadyRunning),
+        Err(TryLockError::Error(source)) => {
+            return Err(Error::LockWorktree {
+                path: worktree_lock_path,
+                source,
+            });
+        }
+    }
+
+    let (port, port_lock, reservations) = reserve_port(&port_locks, identity, assignment.port())?;
+    assignments.remember(identity, assignment, port.get())?;
+
+    drop(allocator_lock);
+    Ok(PortLease {
+        port,
+        worktree_lock,
+        port_lock,
+        reservations,
+    })
+}
+
+fn reserve_port(
+    port_locks: &Path,
+    identity: &WorktreeIdentity,
+    preferred_port: Option<u16>,
+) -> Result<(Port, File, Vec<TcpListener>), Error> {
+    if let Some(port) = preferred_port
+        && let Some(reservation) = try_reserve_port(port_locks, port)?
+    {
+        return Ok(reservation);
+    }
+
+    let start = preferred_port_for(identity).get() - PORT_RANGE_START;
+    for offset in 0..PORT_RANGE_SIZE {
+        let port = PORT_RANGE_START + (start + offset) % PORT_RANGE_SIZE;
+        if preferred_port == Some(port) {
+            continue;
+        }
+        if let Some(reservation) = try_reserve_port(port_locks, port)? {
+            return Ok(reservation);
+        }
+    }
+
+    Err(Error::NoAvailablePort)
+}
+
+fn try_reserve_port(
+    port_locks: &Path,
+    value: u16,
+) -> Result<Option<(Port, File, Vec<TcpListener>)>, Error> {
+    let lock_path = port_locks.join(format!("{value}.lock"));
+    let lock = open_lock(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(source)) => {
+            return Err(Error::LockPort {
+                path: lock_path,
+                source,
+            });
+        }
+    }
+
+    let mut addresses: Vec<_> = ("localhost", value)
+        .to_socket_addrs()
+        .map_err(|source| Error::CheckPort {
+            port: value,
+            source,
+        })?
+        .collect();
+    if addresses.is_empty() {
+        return Err(Error::ResolveLocalhost { port: value });
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+
+    let mut reservations = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        match TcpListener::bind(address) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(source) if source.kind() == io::ErrorKind::AddrInUse => return Ok(None),
+            Err(source) => {
+                return Err(Error::CheckPort {
+                    port: value,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(Some((
+        Port::new(value).expect("Ragavan's port range excludes zero"),
+        lock,
+        reservations,
+    )))
+}
+
+fn preferred_port_for(identity: &WorktreeIdentity) -> Port {
+    let repository_slot = stable_hash(identity.repository_id()) % u64::from(PORT_RANGE_SIZE);
+    let worktree_slot = stable_hash(identity.worktree_id()) % u64::from(PORT_RANGE_SIZE);
+    let value =
+        PORT_RANGE_START + ((repository_slot + worktree_slot) % u64::from(PORT_RANGE_SIZE)) as u16;
 
     Port::new(value).expect("Ragavan's port range excludes zero")
 }
@@ -23,4 +205,331 @@ fn stable_hash(value: &str) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+fn open_lock(path: &Path) -> Result<File, Error> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| Error::OpenLock {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn state_directory() -> Result<PathBuf, Error> {
+    #[cfg(windows)]
+    let (variable, home) = ("LOCALAPPDATA", env::var_os("LOCALAPPDATA"));
+    #[cfg(not(windows))]
+    let (variable, home) = match env::var_os("XDG_STATE_HOME") {
+        Some(home) if !home.is_empty() => ("XDG_STATE_HOME", Some(home)),
+        _ => (
+            "HOME",
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state").into()),
+        ),
+    };
+
+    let home = home
+        .filter(|home| !home.is_empty())
+        .ok_or(Error::StateHomeUnavailable { variable })?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(Error::InvalidStateHome {
+            variable,
+            path: home,
+        });
+    }
+
+    Ok(home.join("ragavan"))
+}
+
+#[derive(Debug)]
+pub enum Error {
+    StateHomeUnavailable {
+        variable: &'static str,
+    },
+    InvalidStateHome {
+        variable: &'static str,
+        path: PathBuf,
+    },
+    CreateState {
+        path: PathBuf,
+        source: io::Error,
+    },
+    OpenLock {
+        path: PathBuf,
+        source: io::Error,
+    },
+    LockAllocator {
+        path: PathBuf,
+        source: io::Error,
+    },
+    LockWorktree {
+        path: PathBuf,
+        source: io::Error,
+    },
+    LockPort {
+        path: PathBuf,
+        source: io::Error,
+    },
+    WorktreeAlreadyRunning,
+    ReadAssignments {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ParseAssignments {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    SerializeAssignments {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    InvalidAssignments {
+        path: PathBuf,
+        detail: String,
+    },
+    WriteAssignments {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ResolveLocalhost {
+        port: u16,
+    },
+    CheckPort {
+        port: u16,
+        source: io::Error,
+    },
+    NoAvailablePort,
+    RunProcess {
+        executable: OsString,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StateHomeUnavailable { variable } => write!(
+                formatter,
+                "could not locate Ragavan's local state because {variable} is unavailable"
+            ),
+            Self::InvalidStateHome { variable, path } => write!(
+                formatter,
+                "could not use {variable} for Ragavan's local state because {} is not an absolute path",
+                path.display()
+            ),
+            Self::CreateState { path, source } => write!(
+                formatter,
+                "could not create Ragavan state directory {}: {source}",
+                path.display()
+            ),
+            Self::OpenLock { path, source } => write!(
+                formatter,
+                "could not open Ragavan lock {}: {source}",
+                path.display()
+            ),
+            Self::LockAllocator { path, source } => write!(
+                formatter,
+                "could not lock Ragavan's port allocator at {}: {source}",
+                path.display()
+            ),
+            Self::LockWorktree { path, source } => write!(
+                formatter,
+                "could not lock the worktree at {}: {source}",
+                path.display()
+            ),
+            Self::LockPort { path, source } => write!(
+                formatter,
+                "could not lock a worktree port at {}: {source}",
+                path.display()
+            ),
+            Self::WorktreeAlreadyRunning => formatter.write_str(
+                "could not start the development process: this worktree already has an active development process",
+            ),
+            Self::ReadAssignments { path, source } => write!(
+                formatter,
+                "could not read Ragavan port assignments from {}: {source}",
+                path.display()
+            ),
+            Self::ParseAssignments { path, source } => write!(
+                formatter,
+                "could not parse Ragavan port assignments at {}: {source}",
+                path.display()
+            ),
+            Self::SerializeAssignments { path, source } => write!(
+                formatter,
+                "could not serialize Ragavan port assignments for {}: {source}",
+                path.display()
+            ),
+            Self::InvalidAssignments { path, detail } => write!(
+                formatter,
+                "could not use Ragavan port assignments at {}: {detail}",
+                path.display()
+            ),
+            Self::WriteAssignments { path, source } => write!(
+                formatter,
+                "could not write Ragavan port assignments to {}: {source}",
+                path.display()
+            ),
+            Self::ResolveLocalhost { port } => write!(
+                formatter,
+                "could not resolve localhost while checking port {port}"
+            ),
+            Self::CheckPort { port, source } => {
+                write!(formatter, "could not check local port {port}: {source}")
+            }
+            Self::NoAvailablePort => formatter.write_str(
+                "could not start the development process: no local port is available in Ragavan's managed range 10000-29999",
+            ),
+            Self::RunProcess { executable, source } => write!(
+                formatter,
+                "could not run {}: {source}",
+                Path::new(executable).display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CreateState { source, .. }
+            | Self::OpenLock { source, .. }
+            | Self::LockAllocator { source, .. }
+            | Self::LockWorktree { source, .. }
+            | Self::LockPort { source, .. }
+            | Self::ReadAssignments { source, .. }
+            | Self::WriteAssignments { source, .. }
+            | Self::CheckPort { source, .. }
+            | Self::RunProcess { source, .. } => Some(source),
+            Self::ParseAssignments { source, .. } | Self::SerializeAssignments { source, .. } => {
+                Some(source)
+            }
+            Self::StateHomeUnavailable { .. }
+            | Self::InvalidStateHome { .. }
+            | Self::WorktreeAlreadyRunning
+            | Self::InvalidAssignments { .. }
+            | Self::ResolveLocalhost { .. }
+            | Self::NoAvailablePort => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, acquire_port_in};
+    use ragavan_core::WorktreeIdentity;
+    use std::{
+        fs, io,
+        net::TcpListener,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn a_port_is_stable_and_reserved_for_the_lease_lifetime() {
+        let state = TestDirectory::new();
+        let identity = identity("stable");
+
+        let lease = acquire_port_in(state.path(), &identity).expect("port should be acquired");
+        let port = lease.port().get();
+        assert!(TcpListener::bind(("localhost", port)).is_err());
+
+        drop(lease);
+        let reservation = TcpListener::bind(("localhost", port))
+            .expect("dropping the lease should release its socket reservation");
+        drop(reservation);
+
+        let lease = acquire_port_in(state.path(), &identity).expect("port should be reacquired");
+        assert_eq!(lease.port().get(), port);
+    }
+
+    #[test]
+    fn an_occupied_preferred_port_is_reassigned_stably() {
+        let state = TestDirectory::new();
+        let identity = identity("occupied");
+        let preferred = acquire_port_in(state.path(), &identity)
+            .expect("preferred port should be acquired")
+            .port()
+            .get();
+        let occupied = TcpListener::bind(("localhost", preferred))
+            .expect("the preferred port should be free after the lease is dropped");
+
+        let reassigned = acquire_port_in(state.path(), &identity)
+            .expect("another port should be acquired")
+            .port()
+            .get();
+        assert_ne!(reassigned, preferred);
+        drop(occupied);
+
+        let lease = acquire_port_in(state.path(), &identity)
+            .expect("the reassigned port should be reacquired");
+        assert_eq!(lease.port().get(), reassigned);
+    }
+
+    #[test]
+    fn simultaneous_worktrees_receive_distinct_ports() {
+        let state = TestDirectory::new();
+        let first = acquire_port_in(state.path(), &identity("worktree-1189"))
+            .expect("first port should be acquired");
+        let second = acquire_port_in(state.path(), &identity("worktree-1754"))
+            .expect("second port should be acquired");
+
+        assert_ne!(first.port(), second.port());
+    }
+
+    #[test]
+    fn one_worktree_cannot_start_twice() {
+        let state = TestDirectory::new();
+        let identity = identity("same");
+        let _lease = acquire_port_in(state.path(), &identity).expect("port should be acquired");
+
+        let error = acquire_port_in(state.path(), &identity)
+            .err()
+            .expect("a second lease should be rejected");
+        assert!(matches!(error, Error::WorktreeAlreadyRunning));
+    }
+
+    fn identity(worktree: &str) -> WorktreeIdentity {
+        WorktreeIdentity::new("runtime-test-repository".to_owned(), worktree.to_owned())
+            .expect("test identity should be valid")
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            for _ in 0..100 {
+                let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "ragavan-runtime-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("could not create test directory {path:?}: {error}"),
+                }
+            }
+            panic!("could not allocate a unique test directory");
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                eprintln!("could not remove test directory {:?}: {error}", self.0);
+            }
+        }
+    }
 }

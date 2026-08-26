@@ -21,8 +21,9 @@ user running Chocolatey:
 choco install ragavan -y
 ```
 
-Open a new PowerShell session after installation. Future versions use the
-ordinary Chocolatey workflow; no Ragavan-specific updater or server is needed:
+Open a new PowerShell session after installation or upgrade. Future versions
+use the ordinary Chocolatey workflow; no Ragavan-specific updater or server is
+needed:
 
 ```powershell
 choco upgrade ragavan -y
@@ -63,13 +64,16 @@ bun dev
 ```
 
 For a package with a simple Vite script such as `"dev": "vite"`, Ragavan adds a
-stable worktree-specific port and requires Vite to use it. `bun run dev` works
-as well. Every other Bun command passes through unchanged, as do Bun commands
-outside enabled repositories.
+stable worktree-specific port and requires Vite to use it. Before Bun starts,
+Ragavan skips occupied ports and coordinates simultaneous worktrees. It retains
+the assignment across restarts and holds its lease until Bun stops, including
+when the terminal interrupts the process. `bun run dev` works as well. Every
+other Bun command passes through unchanged, as do Bun commands outside enabled
+repositories.
 
-Port selection is stable, but occupied-port and hash-collision coordination is
-intentionally left for the next slice. Vite fails clearly instead of silently
-selecting a different port.
+Ragavan keeps port assignments and process-scoped locks in the user's local
+application-state directory. It never writes them into the repository, and no
+daemon is involved.
 
 Enrollment can be inspected or reversed at any time:
 
@@ -106,8 +110,8 @@ layers:
 | `ragavan-cli` | CLI grammar, output contracts, and composition |
 | `ragavan-core` | Shared identities, ports, enrollment, and launch plans |
 | `ragavan-git` | Repository enrollment and worktree discovery |
-| `ragavan-runtime` | Resource allocation and its lifecycle |
-| `ragavan-adapters` | Recognition and launch adjustments for supported stacks |
+| `ragavan-runtime` | Port allocation, process supervision, and resource lifecycles |
+| `ragavan-adapters` | Command-runner and development-stack variants |
 | `ragavan-shell` | Persistent shell integration, profiles, hooks, and their transport protocol |
 
 The CLI library composes the capability crates and the executable only supplies
@@ -115,6 +119,8 @@ its process arguments. Git, runtime, adapters, and shell do not depend on each
 other; shared domain values flow through `ragavan-core`.
 Inside `ragavan-adapters`, command runners such as Bun resolve package scripts
 into a runner-neutral representation consumed by stack adapters such as Vite.
+The runner and stack registries are the only variant composition points; shell,
+CLI, and runtime code remain independent of individual tools.
 
 ## Development
 

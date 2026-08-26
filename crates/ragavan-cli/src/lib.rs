@@ -1,22 +1,27 @@
 #![forbid(unsafe_code)]
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use ragavan_adapters::BunDev;
 use ragavan_core::{Enrollment, LaunchPlan};
 use serde_json::{Value, json};
-use std::{ffi::OsString, fmt, process::ExitCode};
+use std::{
+    ffi::OsString,
+    fmt, io,
+    process::{Command as ProcessCommand, ExitStatus},
+};
 
 const JSON_SCHEMA_VERSION: u8 = 1;
 
-/// Run Ragavan's command-line interface with a complete process argument list.
-pub fn run(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
+/// Run Ragavan's command-line interface and return its process status code.
+pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
     let arguments: Vec<_> = arguments.into_iter().collect();
 
-    if arguments
-        .get(1)
-        .is_some_and(|argument| argument == ragavan_shell::protocol::BUN_ARGUMENTS_COMMAND)
-    {
-        return run_bun_arguments(&arguments[2..]);
+    match ragavan_shell::protocol::parse(arguments.get(1..).unwrap_or_default()) {
+        Ok(Some(request)) => return run_command(request),
+        Ok(None) => {}
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 1;
+        }
     }
 
     let json_requested = arguments.iter().any(|argument| argument == "--json");
@@ -34,7 +39,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
             return report_usage("missing command", format);
         }
         print!("{}", Cli::command().render_help());
-        return ExitCode::SUCCESS;
+        return 0;
     };
 
     let outcome = match command {
@@ -62,15 +67,18 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
                     format,
                 );
             }
-            print!("{}", ragavan_shell::powershell_hook());
-            return ExitCode::SUCCESS;
+            print!(
+                "{}",
+                ragavan_shell::powershell_hook(ragavan_adapters::commands())
+            );
+            return 0;
         }
     };
 
     match outcome {
         Ok(outcome) => {
             outcome.print(format);
-            ExitCode::SUCCESS
+            0
         }
         Err(error) => report_failure(error, format),
     }
@@ -197,41 +205,41 @@ impl Outcome {
     }
 }
 
-fn report_parse_error(error: clap::Error, json_requested: bool) -> ExitCode {
+fn report_parse_error(error: clap::Error, json_requested: bool) -> i32 {
     if matches!(
         error.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     ) {
         if let Err(source) = error.print() {
             eprintln!("error: could not print command help: {source}");
-            return ExitCode::FAILURE;
+            return 1;
         }
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     if json_requested {
         print_json_error("usage", error.to_string().trim_end());
     } else if let Err(source) = error.print() {
         eprintln!("error: could not print command error: {source}");
-        return ExitCode::FAILURE;
+        return 1;
     }
-    ExitCode::from(2)
+    2
 }
 
-fn report_usage(message: &str, format: OutputFormat) -> ExitCode {
+fn report_usage(message: &str, format: OutputFormat) -> i32 {
     match format {
         OutputFormat::Human => eprintln!("error: {message}"),
         OutputFormat::Json => print_json_error("usage", message),
     }
-    ExitCode::from(2)
+    2
 }
 
-fn report_failure(error: Failure, format: OutputFormat) -> ExitCode {
+fn report_failure(error: Failure, format: OutputFormat) -> i32 {
     match format {
         OutputFormat::Human => eprintln!("error: {error}"),
         OutputFormat::Json => print_json_error("operation", &error.to_string()),
     }
-    ExitCode::FAILURE
+    1
 }
 
 fn print_json_error(kind: &str, message: &str) {
@@ -284,42 +292,76 @@ fn enrollment_message(enrollment: Enrollment) -> &'static str {
     }
 }
 
-fn run_bun_arguments(arguments: &[OsString]) -> ExitCode {
-    match plan_bun_dev(arguments) {
-        Ok(Some(plan)) => {
-            for argument in plan.into_additional_arguments() {
-                println!("{argument}");
-            }
-            ExitCode::SUCCESS
-        }
-        Ok(None) => ExitCode::from(ragavan_shell::protocol::PASSTHROUGH_EXIT_CODE),
+fn run_command(request: ragavan_shell::protocol::RunRequest<'_>) -> i32 {
+    match execute_command(&request) {
+        Ok(status) => child_exit_code(status),
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
 
-fn plan_bun_dev(arguments: &[OsString]) -> Result<Option<LaunchPlan>, Failure> {
-    let Some(bun_dev) = BunDev::recognize(arguments) else {
-        return Ok(None);
+fn execute_command(
+    request: &ragavan_shell::protocol::RunRequest<'_>,
+) -> Result<ExitStatus, Failure> {
+    let mut command = ProcessCommand::new(request.executable());
+    command.args(request.arguments());
+    let Some((lease, plan)) = isolate_command(request.command(), request.arguments())? else {
+        return command.status().map_err(|source| Failure::RunCommand {
+            executable: request.executable().to_owned(),
+            source,
+        });
     };
+
+    command.args(plan.into_additional_arguments());
+    lease.run(&mut command).map_err(Failure::from)
+}
+
+fn isolate_command(
+    command: &std::ffi::OsStr,
+    arguments: &[OsString],
+) -> Result<Option<(ragavan_runtime::PortLease, LaunchPlan)>, Failure> {
     let Some(worktree) = ragavan_git::enrolled_worktree()? else {
         return Ok(None);
     };
 
-    let vite = ragavan_adapters::recognize_vite(bun_dev, worktree.root())?;
+    let Some(adjustment) = ragavan_adapters::recognize(command, arguments, worktree.root())? else {
+        return Ok(None);
+    };
     let identity = worktree.identity()?;
-    let port = ragavan_runtime::port_for(&identity);
+    let lease = ragavan_runtime::acquire_port(&identity)?;
+    let plan = adjustment.launch_plan(lease.port());
 
-    Ok(Some(vite.launch_plan(port)))
+    Ok(Some((lease, plan)))
+}
+
+fn child_exit_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+
+    1
 }
 
 #[derive(Debug)]
 enum Failure {
     Git(ragavan_git::Error),
     Adapter(ragavan_adapters::Error),
+    Runtime(ragavan_runtime::Error),
     Shell(ragavan_shell::Error),
+    RunCommand {
+        executable: OsString,
+        source: io::Error,
+    },
 }
 
 impl From<ragavan_git::Error> for Failure {
@@ -334,6 +376,12 @@ impl From<ragavan_adapters::Error> for Failure {
     }
 }
 
+impl From<ragavan_runtime::Error> for Failure {
+    fn from(error: ragavan_runtime::Error) -> Self {
+        Self::Runtime(error)
+    }
+}
+
 impl From<ragavan_shell::Error> for Failure {
     fn from(error: ragavan_shell::Error) -> Self {
         Self::Shell(error)
@@ -345,7 +393,13 @@ impl fmt::Display for Failure {
         match self {
             Self::Git(error) => error.fmt(formatter),
             Self::Adapter(error) => error.fmt(formatter),
+            Self::Runtime(error) => error.fmt(formatter),
             Self::Shell(error) => error.fmt(formatter),
+            Self::RunCommand { executable, source } => write!(
+                formatter,
+                "could not run {}: {source}",
+                std::path::Path::new(executable).display()
+            ),
         }
     }
 }
@@ -355,7 +409,9 @@ impl std::error::Error for Failure {
         match self {
             Self::Git(error) => Some(error),
             Self::Adapter(error) => Some(error),
+            Self::Runtime(error) => Some(error),
             Self::Shell(error) => Some(error),
+            Self::RunCommand { source, .. } => Some(source),
         }
     }
 }

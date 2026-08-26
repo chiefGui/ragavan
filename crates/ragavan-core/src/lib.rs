@@ -62,6 +62,10 @@ impl Port {
     pub fn new(value: u16) -> Option<Self> {
         (value != 0).then_some(Self(value))
     }
+
+    pub fn get(self) -> u16 {
+        self.0
+    }
 }
 
 impl fmt::Display for Port {

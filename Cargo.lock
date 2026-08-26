@@ -127,6 +127,7 @@ name = "ragavan-runtime"
 version = "0.1.0"
 dependencies = [
  "ragavan-core",
+ "serde_json",
 ]
 
 [[package]]

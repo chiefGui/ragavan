@@ -1,47 +1,45 @@
-use crate::ResolvedScript;
-use ragavan_core::{LaunchPlan, Port};
-use std::{ffi::OsString, fmt, path::PathBuf};
+use crate::{Error as AdapterError, ResolvedScript, StackAdjustment};
+use ragavan_core::Port;
+use std::{ffi::OsString, fmt};
 
-pub struct ViteDev;
-
-impl ViteDev {
-    pub fn launch_plan(self, port: Port) -> LaunchPlan {
-        LaunchPlan::with_additional_arguments(vec![
-            "--port".to_owned(),
-            port.to_string(),
-            "--strictPort".to_owned(),
-        ])
-    }
+fn port_arguments(port: Port) -> Vec<String> {
+    vec![
+        "--port".to_owned(),
+        port.to_string(),
+        "--strictPort".to_owned(),
+    ]
 }
 
-pub(crate) fn reject_explicit_port(arguments: &[OsString]) -> Result<(), Error> {
+fn reject_explicit_port(arguments: &[OsString], invocation: &'static str) -> Result<(), Error> {
     if arguments
         .iter()
         .filter_map(|argument| argument.to_str())
         .any(is_port_argument)
     {
-        Err(Error::ExplicitPort)
+        Err(Error::ExplicitPort { invocation })
     } else {
         Ok(())
     }
 }
 
-pub(crate) fn recognize(script: ResolvedScript) -> Result<ViteDev, Error> {
+pub(crate) fn recognize(
+    script: &ResolvedScript<'_>,
+) -> Result<Option<StackAdjustment>, AdapterError> {
     if !is_supported_vite_script(script.command()) {
-        return Err(Error::UnsupportedDevScript {
-            path: script.package_path().to_owned(),
-            script: script.command().to_owned(),
-        });
+        return Ok(None);
     }
+    reject_explicit_port(script.arguments(), script.invocation()).map_err(AdapterError::stack)?;
     if script
         .command()
         .split_ascii_whitespace()
         .any(is_port_argument)
     {
-        return Err(Error::ExplicitPort);
+        return Err(AdapterError::stack(Error::ExplicitPort {
+            invocation: script.invocation(),
+        }));
     }
 
-    Ok(ViteDev)
+    Ok(Some(StackAdjustment::new(port_arguments)))
 }
 
 fn is_port_argument(argument: &str) -> bool {
@@ -66,20 +64,15 @@ fn is_supported_vite_script(script: &str) -> bool {
 
 #[derive(Debug)]
 pub(crate) enum Error {
-    UnsupportedDevScript { path: PathBuf, script: String },
-    ExplicitPort,
+    ExplicitPort { invocation: &'static str },
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedDevScript { path, script } => write!(
+            Self::ExplicitPort { invocation } => write!(
                 formatter,
-                "could not isolate `bun dev`: {} uses unsupported script `{script}`; this slice recognizes Vite",
-                path.display()
-            ),
-            Self::ExplicitPort => formatter.write_str(
-                "could not isolate `bun dev`: an explicit `--port` conflicts with Ragavan's worktree port",
+                "could not isolate `{invocation}`: an explicit `--port` conflicts with Ragavan's worktree port",
             ),
         }
     }

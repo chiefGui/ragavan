@@ -1,10 +1,7 @@
 mod profile;
 
 use self::profile::Profile;
-use crate::{
-    InstallOutcome, UninstallOutcome,
-    protocol::{BUN_ARGUMENTS_COMMAND, PASSTHROUGH_EXIT_CODE},
-};
+use crate::{InstallOutcome, UninstallOutcome, protocol::RUN_COMMAND};
 use std::{
     ffi::OsStr,
     fmt, io,
@@ -17,36 +14,35 @@ const CURRENT_SHELL_OPERATION: &str = "identify the current shell";
 #[cfg(windows)]
 const NOT_POWERSHELL_EXIT_CODE: i32 = 4;
 
-const POWERSHELL_HOOK: &str = r#"$global:__RagavanOriginalBun = Get-Command bun -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+const POWERSHELL_HOOK_HEADER: &str = r#"$global:__RagavanOriginalCommands = @{}
 $global:__RagavanCommand = Get-Command ragavan -CommandType Application -ErrorAction Stop | Select-Object -First 1
+"#;
 
-if ($null -ne $global:__RagavanOriginalBun) {
-    function global:bun {
-        $ragavanArguments = & $global:__RagavanCommand __RAGAVAN_BUN_ARGUMENTS_COMMAND__ @args
-        $ragavanStatus = $LASTEXITCODE
-
-        if ($ragavanStatus -eq 0) {
-            & $global:__RagavanOriginalBun @args @ragavanArguments
-            return
-        }
-
-        if ($ragavanStatus -eq __RAGAVAN_PASSTHROUGH_EXIT_CODE__) {
-            & $global:__RagavanOriginalBun @args
-            return
-        }
-
-        $global:LASTEXITCODE = $ragavanStatus
+const POWERSHELL_COMMAND_HOOK: &str = r#"
+$global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'] = Get-Command '__RAGAVAN_COMMAND__' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -ne $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__']) {
+    function global:__RAGAVAN_COMMAND__ {
+        & $global:__RagavanCommand __RAGAVAN_RUN_COMMAND__ '__RAGAVAN_COMMAND__' $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'].Path @args
     }
 }
 "#;
 
-pub(super) fn hook() -> String {
-    POWERSHELL_HOOK
-        .replace("__RAGAVAN_BUN_ARGUMENTS_COMMAND__", BUN_ARGUMENTS_COMMAND)
-        .replace(
-            "__RAGAVAN_PASSTHROUGH_EXIT_CODE__",
-            &PASSTHROUGH_EXIT_CODE.to_string(),
-        )
+pub(super) fn hook<'a>(commands: impl IntoIterator<Item = &'a str>) -> String {
+    let mut hook = POWERSHELL_HOOK_HEADER.to_owned();
+    for command in commands {
+        assert!(
+            command
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "shell command names must be safe PowerShell identifiers"
+        );
+        hook.push_str(
+            &POWERSHELL_COMMAND_HOOK
+                .replace("__RAGAVAN_COMMAND__", command)
+                .replace("__RAGAVAN_RUN_COMMAND__", RUN_COMMAND),
+        );
+    }
+    hook
 }
 
 pub(super) struct PowerShell {
@@ -416,6 +412,16 @@ mod tests {
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn hook_renders_every_registered_command_through_one_protocol() {
+        let hook = hook(["alpha", "beta"]);
+
+        assert!(hook.contains("function global:alpha"));
+        assert!(hook.contains("__run 'alpha'"));
+        assert!(hook.contains("function global:beta"));
+        assert!(hook.contains("__run 'beta'"));
+    }
 
     #[test]
     fn installation_is_idempotent_and_uninstallation_restores_user_content() {
