@@ -1,3 +1,4 @@
+use ragavan_core::{ServiceScope, ServiceScopeError};
 use std::{
     env, fmt, fs, io,
     path::{Path, PathBuf},
@@ -5,17 +6,18 @@ use std::{
 
 pub(super) struct PackageScript {
     path: PathBuf,
+    scope: ServiceScope,
     source: String,
 }
 
 impl PackageScript {
-    pub(super) fn into_parts(self) -> (PathBuf, String) {
-        (self.path, self.source)
+    pub(super) fn into_parts(self) -> (PathBuf, ServiceScope, String) {
+        (self.path, self.scope, self.source)
     }
 }
 
 pub(super) fn find_script(worktree_root: &Path, script_name: &str) -> Result<PackageScript, Error> {
-    let package_path = nearest_package_json(worktree_root)?;
+    let (package_path, scope) = nearest_package_json(worktree_root)?;
     let package = fs::read(&package_path).map_err(|source| Error::ReadPackage {
         path: package_path.clone(),
         source,
@@ -38,11 +40,12 @@ pub(super) fn find_script(worktree_root: &Path, script_name: &str) -> Result<Pac
 
     Ok(PackageScript {
         path: package_path,
+        scope,
         source,
     })
 }
 
-fn nearest_package_json(worktree_root: &Path) -> Result<PathBuf, Error> {
+fn nearest_package_json(worktree_root: &Path) -> Result<(PathBuf, ServiceScope), Error> {
     let current_directory = env::current_dir().map_err(Error::CurrentDirectory)?;
     let resolved_current_directory =
         fs::canonicalize(&current_directory).map_err(|source| Error::ResolveDirectory {
@@ -57,7 +60,7 @@ fn nearest_package_json(worktree_root: &Path) -> Result<PathBuf, Error> {
 
     if !resolved_current_directory.starts_with(&resolved_worktree_root) {
         return Err(Error::CurrentDirectoryOutsideWorktree {
-            current_directory,
+            current_directory: current_directory.clone(),
             root: worktree_root.to_owned(),
         });
     }
@@ -65,7 +68,23 @@ fn nearest_package_json(worktree_root: &Path) -> Result<PathBuf, Error> {
     for directory in resolved_current_directory.ancestors() {
         let package_path = directory.join("package.json");
         match fs::metadata(&package_path) {
-            Ok(metadata) if metadata.is_file() => return Ok(package_path),
+            Ok(metadata) if metadata.is_file() => {
+                let relative_directory =
+                    directory
+                        .strip_prefix(&resolved_worktree_root)
+                        .map_err(|_| Error::CurrentDirectoryOutsideWorktree {
+                            current_directory: current_directory.clone(),
+                            root: worktree_root.to_owned(),
+                        })?;
+                let scope =
+                    ServiceScope::from_relative_path(relative_directory).map_err(|source| {
+                        Error::InvalidServiceScope {
+                            path: directory.to_owned(),
+                            source,
+                        }
+                    })?;
+                return Ok((package_path, scope));
+            }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
@@ -111,6 +130,10 @@ pub(super) enum Error {
         path: PathBuf,
         source: serde_json::Error,
     },
+    InvalidServiceScope {
+        path: PathBuf,
+        source: ServiceScopeError,
+    },
     MissingScript {
         path: PathBuf,
         name: String,
@@ -150,6 +173,11 @@ impl fmt::Display for Error {
             Self::ParsePackage { path, source } => {
                 write!(formatter, "could not parse {}: {source}", path.display())
             }
+            Self::InvalidServiceScope { path, source } => write!(
+                formatter,
+                "could not identify package directory {} as a service: {source}",
+                path.display()
+            ),
             Self::MissingScript { path, name } => write!(
                 formatter,
                 "{} has no string `scripts.{name}`",
@@ -166,6 +194,7 @@ impl std::error::Error for Error {
             Self::ResolveDirectory { source, .. } => Some(source),
             Self::ReadPackage { source, .. } => Some(source),
             Self::ParsePackage { source, .. } => Some(source),
+            Self::InvalidServiceScope { source, .. } => Some(source),
             _ => None,
         }
     }

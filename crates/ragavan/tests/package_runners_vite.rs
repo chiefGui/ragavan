@@ -85,14 +85,57 @@ fn supervised_worktrees_own_distinct_stable_ports_until_exit() {
     assert_eq!(duplicate.status.code(), Some(1), "{duplicate:?}");
     assert!(stderr(&duplicate).contains("already has an active development process"));
 
-    stop_bun(main_process);
-    stop_bun(linked_process);
+    stop_runner(main_process);
+    stop_runner(linked_process);
     assert_eq!(development_port(repository.path()), main_port);
     assert_eq!(development_port(&linked_worktree), linked_port);
 }
 
 #[test]
-fn vite_plus_after_setup_commands_receives_the_worktree_port() {
+fn packages_own_distinct_stable_ports_across_runners_and_scripts() {
+    let repository = TestRepository::new();
+    let web = repository.path().join("apps/web");
+    let web_source = web.join("src");
+    let api = repository.path().join("apps/api");
+    fs::create_dir_all(&web_source).expect("the web package should be created");
+    fs::create_dir_all(&api).expect("the API package should be created");
+    let package = r#"{"scripts":{"dev":"vite","start":"vite"}}"#;
+    fs::write(repository.path().join("package.json"), package)
+        .expect("the root package should be written");
+    fs::write(web.join("package.json"), package).expect("the web package should be written");
+    fs::write(api.join("package.json"), package).expect("the API package should be written");
+    assert_stdout(git(repository.path(), &["add", "package.json", "apps"]), "");
+    assert_success(&git(
+        repository.path(),
+        &["commit", "-m", "add workspace packages"],
+    ));
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let bun = FakeCommand::waiting("bun");
+    let pnpm = FakeCommand::waiting("pnpm");
+    let npm = FakeCommand::waiting("npm");
+    let (root_process, root_port) =
+        start_package_runner(repository.path(), "bun", bun.path(), &["dev"]);
+    let (web_process, web_port) = start_package_runner(&web_source, "pnpm", pnpm.path(), &["dev"]);
+    let duplicate = package_runner(&web, "npm", &["start"]);
+    assert_eq!(duplicate.status.code(), Some(1), "{duplicate:?}");
+    assert!(stderr(&duplicate).contains("already has an active development process"));
+    let (api_process, api_port) = start_package_runner(&api, "npm", npm.path(), &["start"]);
+    assert_ne!(root_port, web_port);
+    assert_ne!(root_port, api_port);
+    assert_ne!(web_port, api_port);
+
+    stop_runner(root_process);
+    stop_runner(web_process);
+    stop_runner(api_process);
+    assert_eq!(development_port(repository.path()), root_port);
+    assert_eq!(development_port_for(&web, "npm", &["start"]), web_port);
+    assert_eq!(development_port_for(&api, "bun", &["dev"]), api_port);
+    assert_stdout(git(repository.path(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn vite_plus_after_setup_commands_receives_the_service_port() {
     let repository = TestRepository::new();
     write_package(
         &repository,
@@ -135,7 +178,7 @@ fn bun_commands_pass_through_until_isolation_applies() {
 }
 
 #[test]
-fn npm_and_pnpm_run_vite_with_the_worktree_port() {
+fn npm_and_pnpm_run_vite_with_the_service_port() {
     let repository = TestRepository::new();
     write_package(&repository, r#"{"scripts":{"dev":"vite","start":"vite"}}"#);
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
@@ -536,10 +579,19 @@ fn bun(directory: &Path, arguments: &[&str]) -> Output {
 
 fn package_runner(directory: &Path, command: &str, arguments: &[&str]) -> Output {
     let executable = FakeCommand::printing(command);
+    run_package_runner(directory, command, executable.path(), arguments)
+}
+
+fn run_package_runner(
+    directory: &Path,
+    command: &str,
+    executable: &Path,
+    arguments: &[&str],
+) -> Output {
     ragavan_command(directory)
         .arg("__run")
         .arg(command)
-        .arg(executable.path())
+        .arg(executable)
         .args(arguments)
         .output()
         .expect("Ragavan should run the package manager")
@@ -648,53 +700,68 @@ fn command_file_name(name: &str) -> String {
 }
 
 fn run_bun(directory: &Path, bun: &Path, arguments: &[&str]) -> Output {
-    ragavan_command(directory)
-        .arg("__run")
-        .arg("bun")
-        .arg(bun)
-        .args(arguments)
-        .output()
-        .expect("Ragavan should run Bun")
+    run_package_runner(directory, "bun", bun, arguments)
 }
 
-fn start_bun(directory: &Path, bun: &Path) -> (Child, u16) {
+fn start_package_runner(
+    directory: &Path,
+    command: &str,
+    executable: &Path,
+    arguments: &[&str],
+) -> (Child, u16) {
     let mut child = ragavan_command(directory)
         .arg("__run")
-        .arg("bun")
-        .arg(bun)
-        .arg("dev")
+        .arg(command)
+        .arg(executable)
+        .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("Ragavan should start Bun");
-    let stdout = child.stdout.take().expect("Bun stdout should be piped");
+        .expect("Ragavan should start the package manager");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("package-manager stdout should be piped");
     let mut lines = BufReader::new(stdout).lines();
-    let arguments: Vec<_> = (0..4)
-        .map(|_| {
-            lines
-                .next()
-                .expect("Bun should print every argument")
-                .expect("Bun arguments should be readable")
-        })
-        .collect();
-    assert_eq!(arguments[0], "dev");
-    assert_eq!(arguments[1], "--port");
-    assert_eq!(arguments[3], "--strictPort");
-    let port = arguments[2].parse().expect("port should be numeric");
+    let mut delivered_arguments = Vec::new();
+    loop {
+        let argument = lines
+            .next()
+            .expect("the package manager should print its arguments")
+            .expect("package-manager arguments should be readable");
+        let complete = argument == "--strictPort";
+        delivered_arguments.push(argument);
+        if complete {
+            break;
+        }
+    }
+    assert_eq!(
+        &delivered_arguments[..arguments.len()],
+        arguments,
+        "the original runner arguments should be preserved"
+    );
+    let port = port_from_arguments(&delivered_arguments);
 
     (child, port)
 }
 
-fn stop_bun(mut child: Child) {
+fn start_bun(directory: &Path, bun: &Path) -> (Child, u16) {
+    start_package_runner(directory, "bun", bun, &["dev"])
+}
+
+fn stop_runner(mut child: Child) {
     writeln!(
-        child.stdin.take().expect("Bun stdin should be piped"),
+        child
+            .stdin
+            .take()
+            .expect("package-manager stdin should be piped"),
         "stop"
     )
-    .expect("Bun should receive its stop signal");
+    .expect("the package manager should receive its stop signal");
     let output = child
         .wait_with_output()
-        .expect("Ragavan should wait for Bun");
+        .expect("Ragavan should wait for the package manager");
     assert_success(&output);
     assert_eq!(stderr(&output), "", "{output:?}");
 }
@@ -706,14 +773,28 @@ fn assert_bun_arguments(output: Output, expected: &[&str]) {
 }
 
 fn development_port(directory: &Path) -> u16 {
-    let output = bun(directory, &["dev"]);
+    development_port_for(directory, "bun", &["dev"])
+}
+
+fn development_port_for(directory: &Path, command: &str, arguments: &[&str]) -> u16 {
+    let output = package_runner(directory, command, arguments);
     assert_success(&output);
     assert_eq!(stderr(&output), "", "{output:?}");
 
     let arguments: Vec<_> = stdout(&output).lines().map(str::to_owned).collect();
-    assert_eq!(arguments.first().map(String::as_str), Some("dev"));
-    assert_eq!(arguments.get(1).map(String::as_str), Some("--port"));
-    assert_eq!(arguments.get(3).map(String::as_str), Some("--strictPort"));
-    assert_eq!(arguments.len(), 4);
-    arguments[2].parse().expect("port should be numeric")
+    port_from_arguments(&arguments)
+}
+
+fn port_from_arguments(arguments: &[String]) -> u16 {
+    let port_index = arguments
+        .iter()
+        .position(|argument| argument == "--port")
+        .expect("Vite should receive a port")
+        + 1;
+    assert_eq!(arguments.last().map(String::as_str), Some("--strictPort"));
+    arguments
+        .get(port_index)
+        .expect("Vite's port should have a value")
+        .parse()
+        .expect("Vite's port should be numeric")
 }

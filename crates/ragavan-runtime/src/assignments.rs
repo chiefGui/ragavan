@@ -121,7 +121,7 @@ impl PortAssignments {
 
 fn key(identity: &ServiceIdentity) -> String {
     let worktree = identity.worktree();
-    let scope = identity.scope().unwrap_or_default();
+    let scope = identity.scope().relative_path().unwrap_or_default();
 
     format!(
         "s:{}:{}{}:{}{}:{}",

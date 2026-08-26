@@ -329,10 +329,10 @@ fn isolate_command(
     let Some(worktree) = ragavan_git::enrolled_worktree()? else {
         return Ok(None);
     };
-    let adjustment = development_command.resolve(worktree.root())?;
-    let identity = ServiceIdentity::root(worktree.identity()?);
+    let isolation = development_command.resolve(worktree.root())?;
+    let identity = ServiceIdentity::new(worktree.identity()?, isolation.service_scope().clone());
     let lease = ragavan_runtime::acquire_port(&identity)?;
-    let plan = adjustment.launch_plan(lease.port());
+    let plan = isolation.launch_plan(lease.port());
 
     Ok(Some((lease, plan)))
 }

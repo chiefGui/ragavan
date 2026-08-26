@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{
+    fmt,
+    path::{Component, Path},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Enrollment {
@@ -56,53 +59,80 @@ impl fmt::Display for IdentityError {
 impl std::error::Error for IdentityError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceScope(Option<String>);
+
+impl ServiceScope {
+    pub fn from_relative_path(path: &Path) -> Result<Self, ServiceScopeError> {
+        let mut normalized = String::new();
+
+        for component in path.components() {
+            let component = match component {
+                Component::CurDir => continue,
+                Component::Normal(component) => component,
+                Component::ParentDir => return Err(ServiceScopeError::ParentTraversal),
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(ServiceScopeError::NonRelativePath);
+                }
+            };
+            let component = component
+                .to_str()
+                .ok_or(ServiceScopeError::NonUnicodePath)?;
+            if !normalized.is_empty() {
+                normalized.push('/');
+            }
+            normalized.push_str(component);
+        }
+
+        Ok(Self((!normalized.is_empty()).then_some(normalized)))
+    }
+
+    pub fn relative_path(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceScopeError {
+    NonRelativePath,
+    ParentTraversal,
+    NonUnicodePath,
+}
+
+impl fmt::Display for ServiceScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonRelativePath => formatter.write_str("service scope must be a relative path"),
+            Self::ParentTraversal => {
+                formatter.write_str("service scope cannot traverse to a parent directory")
+            }
+            Self::NonUnicodePath => {
+                formatter.write_str("service scope path must contain valid Unicode")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServiceScopeError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceIdentity {
     worktree: WorktreeIdentity,
-    scope: Option<String>,
+    scope: ServiceScope,
 }
 
 impl ServiceIdentity {
-    pub fn root(worktree: WorktreeIdentity) -> Self {
-        Self {
-            worktree,
-            scope: None,
-        }
-    }
-
-    pub fn scoped(worktree: WorktreeIdentity, scope: String) -> Result<Self, ServiceIdentityError> {
-        if scope.is_empty() {
-            return Err(ServiceIdentityError::EmptyScope);
-        }
-
-        Ok(Self {
-            worktree,
-            scope: Some(scope),
-        })
+    pub fn new(worktree: WorktreeIdentity, scope: ServiceScope) -> Self {
+        Self { worktree, scope }
     }
 
     pub fn worktree(&self) -> &WorktreeIdentity {
         &self.worktree
     }
 
-    pub fn scope(&self) -> Option<&str> {
-        self.scope.as_deref()
+    pub fn scope(&self) -> &ServiceScope {
+        &self.scope
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ServiceIdentityError {
-    EmptyScope,
-}
-
-impl fmt::Display for ServiceIdentityError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyScope => formatter.write_str("service scope cannot be empty"),
-        }
-    }
-}
-
-impl std::error::Error for ServiceIdentityError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Port(u16);
@@ -142,27 +172,46 @@ impl LaunchPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceIdentity, ServiceIdentityError, WorktreeIdentity};
+    use super::{ServiceIdentity, ServiceScope, ServiceScopeError, WorktreeIdentity};
+    use std::path::Path;
 
     #[test]
     fn a_service_is_rooted_or_scoped_within_one_worktree() {
         let worktree = worktree();
-        let root = ServiceIdentity::root(worktree.clone());
-        let scoped = ServiceIdentity::scoped(worktree.clone(), "apps/web".to_owned())
-            .expect("the service scope should be valid");
+        let root = ServiceIdentity::new(
+            worktree.clone(),
+            ServiceScope::from_relative_path(Path::new(""))
+                .expect("the root service scope should be valid"),
+        );
+        let scoped = ServiceIdentity::new(
+            worktree.clone(),
+            ServiceScope::from_relative_path(Path::new("apps/web"))
+                .expect("the nested service scope should be valid"),
+        );
 
         assert_eq!(root.worktree(), &worktree);
-        assert_eq!(root.scope(), None);
+        assert_eq!(root.scope().relative_path(), None);
         assert_eq!(scoped.worktree(), &worktree);
-        assert_eq!(scoped.scope(), Some("apps/web"));
+        assert_eq!(scoped.scope().relative_path(), Some("apps/web"));
     }
 
     #[test]
-    fn a_scoped_service_requires_a_nonempty_scope() {
-        let error = ServiceIdentity::scoped(worktree(), String::new())
-            .expect_err("an empty service scope should be rejected");
+    fn service_scopes_normalize_relative_paths() {
+        let scope = ServiceScope::from_relative_path(Path::new("./apps/./web"))
+            .expect("the relative service path should be valid");
 
-        assert_eq!(error, ServiceIdentityError::EmptyScope);
+        assert_eq!(scope.relative_path(), Some("apps/web"));
+    }
+
+    #[test]
+    fn service_scopes_reject_paths_outside_the_worktree() {
+        let parent = ServiceScope::from_relative_path(Path::new("../web"))
+            .expect_err("parent traversal should be rejected");
+        let absolute = ServiceScope::from_relative_path(Path::new("/apps/web"))
+            .expect_err("an absolute path should be rejected");
+
+        assert_eq!(parent, ServiceScopeError::ParentTraversal);
+        assert_eq!(absolute, ServiceScopeError::NonRelativePath);
     }
 
     fn worktree() -> WorktreeIdentity {

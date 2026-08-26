@@ -8,7 +8,7 @@ mod script;
 mod vite;
 mod vite_plus;
 
-use ragavan_core::{LaunchPlan, Port};
+use ragavan_core::{LaunchPlan, Port, ServiceScope};
 use script::{Invocation, Script};
 use std::{
     ffi::{OsStr, OsString},
@@ -46,7 +46,7 @@ pub fn development_command<'a>(
     (runner.recognize)(arguments)
 }
 
-/// A package-script command that may require worktree isolation.
+/// A package-script development command that may require isolation.
 pub struct DevelopmentCommand<'a> {
     invocation: &'static str,
     script_name: &'static str,
@@ -69,8 +69,8 @@ impl<'a> DevelopmentCommand<'a> {
         }
     }
 
-    /// Resolve the package script and describe its port-specific adjustment.
-    pub fn resolve(self, worktree_root: &Path) -> Result<PortAdjustment, Error> {
+    /// Resolve the package service and describe its port-specific adjustment.
+    pub fn resolve(self, worktree_root: &Path) -> Result<IsolationPlan, Error> {
         let package_script =
             package_json::find_script(worktree_root, self.script_name).map_err(|source| {
                 Error(ErrorKind::Package {
@@ -78,7 +78,7 @@ impl<'a> DevelopmentCommand<'a> {
                     source,
                 })
             })?;
-        let (package_path, source) = package_script.into_parts();
+        let (package_path, service_scope, source) = package_script.into_parts();
         let script = match Script::parse(&source) {
             Ok(script) => script,
             Err(source_error) => {
@@ -94,6 +94,7 @@ impl<'a> DevelopmentCommand<'a> {
         resolve_stack(ResolvedScript {
             invocation: self.invocation,
             package_path,
+            service_scope,
             source,
             script,
             arguments: self.forwarded_arguments,
@@ -106,7 +107,7 @@ fn deliver_directly(arguments: Vec<String>) -> Vec<String> {
     arguments
 }
 
-fn resolve_stack(script: ResolvedScript<'_>) -> Result<PortAdjustment, Error> {
+fn resolve_stack(script: ResolvedScript<'_>) -> Result<IsolationPlan, Error> {
     let mut recognized = None;
 
     for (index, invocation) in script.script.invocations().iter().enumerate() {
@@ -141,19 +142,26 @@ fn resolve_stack(script: ResolvedScript<'_>) -> Result<PortAdjustment, Error> {
     }
 
     let stack_adjustment = (stack.adjust)(invocation, script.arguments, script.invocation)?;
-    Ok(PortAdjustment {
+    Ok(IsolationPlan {
+        service_scope: script.service_scope,
         port_arguments: stack_adjustment.port_arguments,
         deliver_arguments: script.deliver_arguments,
     })
 }
 
-/// A recognized command's runner-aware adjustment for an allocated port.
-pub struct PortAdjustment {
+/// A recognized development command's resolved service and launch adjustment.
+pub struct IsolationPlan {
+    service_scope: ServiceScope,
     port_arguments: fn(Port) -> Vec<String>,
     deliver_arguments: fn(Vec<String>) -> Vec<String>,
 }
 
-impl PortAdjustment {
+impl IsolationPlan {
+    /// Return the discovered service's scope within its Git worktree.
+    pub fn service_scope(&self) -> &ServiceScope {
+        &self.service_scope
+    }
+
     /// Build the arguments that must be appended to the original command.
     pub fn launch_plan(self, port: Port) -> LaunchPlan {
         let arguments = (self.port_arguments)(port);
@@ -168,6 +176,7 @@ struct StackAdjustment {
 struct ResolvedScript<'a> {
     invocation: &'static str,
     package_path: PathBuf,
+    service_scope: ServiceScope,
     source: String,
     script: script::Script,
     arguments: &'a [OsString],

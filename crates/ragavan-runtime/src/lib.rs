@@ -190,6 +190,7 @@ fn preferred_port_for(identity: &ServiceIdentity) -> Port {
     let worktree_slot = stable_hash(worktree.worktree_id()) % range_size;
     let service_slot = identity
         .scope()
+        .relative_path()
         .map_or(0, |scope| stable_hash(scope) % range_size);
     let value =
         PORT_RANGE_START + ((repository_slot + worktree_slot + service_slot) % range_size) as u16;
@@ -424,7 +425,7 @@ impl std::error::Error for Error {
 #[cfg(test)]
 mod tests {
     use super::{Error, acquire_port_in};
-    use ragavan_core::{ServiceIdentity, WorktreeIdentity};
+    use ragavan_core::{ServiceIdentity, ServiceScope, WorktreeIdentity};
     use std::{
         fs, io,
         net::TcpListener,
@@ -530,7 +531,11 @@ mod tests {
     }
 
     fn root_service(worktree: &str) -> ServiceIdentity {
-        ServiceIdentity::root(worktree_identity(worktree))
+        ServiceIdentity::new(
+            worktree_identity(worktree),
+            ServiceScope::from_relative_path(Path::new(""))
+                .expect("test service scope should be valid"),
+        )
     }
 
     fn scoped_service(worktree: &str, scope: &str) -> ServiceIdentity {
@@ -538,12 +543,12 @@ mod tests {
     }
 
     fn scoped_service_in(repository: &str, worktree: &str, scope: &str) -> ServiceIdentity {
-        ServiceIdentity::scoped(
+        ServiceIdentity::new(
             WorktreeIdentity::new(repository.to_owned(), worktree.to_owned())
                 .expect("test worktree identity should be valid"),
-            scope.to_owned(),
+            ServiceScope::from_relative_path(Path::new(scope))
+                .expect("test service scope should be valid"),
         )
-        .expect("test service identity should be valid")
     }
 
     fn worktree_identity(worktree: &str) -> WorktreeIdentity {
