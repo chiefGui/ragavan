@@ -3,7 +3,7 @@
 use ragavan_core::{Enrollment, IdentityError, WorktreeIdentity};
 use std::{
     fmt, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -71,6 +71,65 @@ pub fn enrolled_worktree() -> Result<Option<EnrolledWorktree>, Error> {
     }
 
     Ok(Some(EnrolledWorktree { context }))
+}
+
+/// Return tracked and unignored untracked files with the requested basename.
+pub fn source_files_named(root: &Path, file_name: &str) -> Result<Vec<PathBuf>, Error> {
+    const OPERATION: &str = "list repository source files";
+    if file_name.is_empty()
+        || !file_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(Error::InvalidSourceFileName(file_name.to_owned()));
+    }
+
+    let pathspec = format!(":(top,glob)**/{file_name}");
+    let output = git_at(
+        OPERATION,
+        root,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            &pathspec,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(Error::git(OPERATION, output));
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|source| Error::NonUtf8GitOutput {
+        operation: OPERATION,
+        source,
+    })?;
+    if !stdout.is_empty() && !stdout.ends_with('\0') {
+        return Err(Error::UnexpectedGitOutput {
+            operation: OPERATION,
+            output: stdout.to_owned(),
+        });
+    }
+
+    stdout
+        .split_terminator('\0')
+        .map(|file| {
+            let path = Path::new(file);
+            if !path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+                || path.file_name().is_none_or(|name| name != file_name)
+            {
+                return Err(Error::UnexpectedGitOutput {
+                    operation: OPERATION,
+                    output: file.to_owned(),
+                });
+            }
+            Ok(path.to_owned())
+        })
+        .collect()
 }
 
 pub struct EnrolledWorktree {
@@ -232,7 +291,23 @@ fn repository_context() -> Result<Option<RepositoryContext>, Error> {
 }
 
 fn git(operation: &'static str, arguments: &[&str]) -> Result<Output, Error> {
-    Command::new("git")
+    git_command(operation, None, arguments)
+}
+
+fn git_at(operation: &'static str, directory: &Path, arguments: &[&str]) -> Result<Output, Error> {
+    git_command(operation, Some(directory), arguments)
+}
+
+fn git_command(
+    operation: &'static str,
+    directory: Option<&Path>,
+    arguments: &[&str],
+) -> Result<Output, Error> {
+    let mut command = Command::new("git");
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    command
         .args(arguments)
         .output()
         .map_err(|source| Error::StartGit { operation, source })
@@ -257,6 +332,7 @@ pub enum Error {
         operation: &'static str,
         source: std::str::Utf8Error,
     },
+    InvalidSourceFileName(String),
     InvalidRepositoryId,
     InvalidWorktreeId,
     MissingRepositoryId,
@@ -307,6 +383,10 @@ impl fmt::Display for Error {
             Self::NonUtf8GitOutput { operation, source } => {
                 write!(formatter, "could not {operation}: {source}")
             }
+            Self::InvalidSourceFileName(file_name) => write!(
+                formatter,
+                "source filename `{file_name}` must contain only letters, numbers, dots, hyphens, or underscores"
+            ),
             Self::InvalidRepositoryId => formatter.write_str(
                 "the Ragavan repository identity is empty; run `ragavan disable` and then `ragavan enable`",
             ),

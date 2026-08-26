@@ -39,8 +39,9 @@ need Ragavan-specific configuration or application changes.
   its current branch or path.
 - A **service** is an independently running development target within a
   worktree.
-- For package runners, the nearest package directory identifies the service;
-  runner and script aliases do not.
+- For package runners, an explicit single-package target identifies the service;
+  otherwise the nearest package directory does. Runner and script aliases do
+  not affect identity.
 - Every allocated resource belongs to one service and has one explicit cleanup
   lifecycle.
 

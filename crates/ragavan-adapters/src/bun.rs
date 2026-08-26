@@ -1,4 +1,4 @@
-use crate::{DevelopmentCommand, Runner, deliver_directly};
+use crate::{DevelopmentCommand, PackageTarget, Runner, deliver_directly};
 use std::ffi::OsString;
 
 pub(super) const ADAPTER: Runner = Runner {
@@ -16,6 +16,7 @@ fn recognize(arguments: &[OsString]) -> Option<DevelopmentCommand<'_>> {
     Some(DevelopmentCommand::new(
         "bun dev",
         "dev",
+        PackageTarget::CurrentDirectory,
         script_arguments,
         deliver_directly,
     ))

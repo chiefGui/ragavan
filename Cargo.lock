@@ -95,6 +95,7 @@ name = "ragavan-adapters"
 version = "0.1.0"
 dependencies = [
  "ragavan-core",
+ "ragavan-git",
  "serde_json",
 ]
 

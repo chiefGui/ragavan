@@ -50,6 +50,7 @@ pub fn development_command<'a>(
 pub struct DevelopmentCommand<'a> {
     invocation: &'static str,
     script_name: &'static str,
+    package_target: PackageTarget<'a>,
     forwarded_arguments: &'a [OsString],
     deliver_arguments: fn(Vec<String>) -> Vec<String>,
 }
@@ -58,12 +59,14 @@ impl<'a> DevelopmentCommand<'a> {
     fn new(
         invocation: &'static str,
         script_name: &'static str,
+        package_target: PackageTarget<'a>,
         forwarded_arguments: &'a [OsString],
         deliver_arguments: fn(Vec<String>) -> Vec<String>,
     ) -> Self {
         Self {
             invocation,
             script_name,
+            package_target,
             forwarded_arguments,
             deliver_arguments,
         }
@@ -71,13 +74,37 @@ impl<'a> DevelopmentCommand<'a> {
 
     /// Resolve the package service and describe its port-specific adjustment.
     pub fn resolve(self, worktree_root: &Path) -> Result<IsolationPlan, Error> {
-        let package_script =
-            package_json::find_script(worktree_root, self.script_name).map_err(|source| {
-                Error(ErrorKind::Package {
+        let package_script = match self.package_target {
+            PackageTarget::CurrentDirectory => {
+                package_json::find_nearest_script(worktree_root, self.script_name)
+            }
+            PackageTarget::Selected(selector) => {
+                package_json::find_selected_script(worktree_root, selector, self.script_name)
+            }
+            PackageTarget::MissingValue(option) => {
+                return Err(Error(ErrorKind::MissingPackageTarget {
                     invocation: self.invocation,
-                    source,
-                })
-            })?;
+                    option,
+                }));
+            }
+            PackageTarget::Multiple => {
+                return Err(Error(ErrorKind::MultiplePackageTargets {
+                    invocation: self.invocation,
+                }));
+            }
+            PackageTarget::NonExact(selector) => {
+                return Err(Error(ErrorKind::NonExactPackageTarget {
+                    invocation: self.invocation,
+                    selector: selector.to_owned(),
+                }));
+            }
+        }
+        .map_err(|source| {
+            Error(ErrorKind::Package {
+                invocation: self.invocation,
+                source,
+            })
+        })?;
         let (package_path, service_scope, source) = package_script.into_parts();
         let script = match Script::parse(&source) {
             Ok(script) => script,
@@ -101,6 +128,60 @@ impl<'a> DevelopmentCommand<'a> {
             deliver_arguments: self.deliver_arguments,
         })
     }
+}
+
+#[derive(Clone, Copy)]
+enum PackageTarget<'a> {
+    CurrentDirectory,
+    Selected(PackageSelector<'a>),
+    MissingValue(&'static str),
+    Multiple,
+    NonExact(&'a OsStr),
+}
+
+impl<'a> PackageTarget<'a> {
+    fn select(&mut self, selector: PackageSelector<'a>, option: &'static str) {
+        if selector.value().is_empty() {
+            *self = Self::MissingValue(option);
+            return;
+        }
+
+        *self = match *self {
+            Self::CurrentDirectory => Self::Selected(selector),
+            Self::Selected(existing) if existing == selector => *self,
+            Self::MissingValue(_) => *self,
+            Self::Selected(_) | Self::Multiple | Self::NonExact(_) => Self::Multiple,
+        };
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PackageSelector<'a> {
+    Name(&'a OsStr),
+    Directory {
+        value: &'a OsStr,
+        relative_to: SelectorBase,
+    },
+    NameOrDirectory {
+        value: &'a OsStr,
+        relative_to: SelectorBase,
+    },
+}
+
+impl<'a> PackageSelector<'a> {
+    fn value(self) -> &'a OsStr {
+        match self {
+            Self::Name(value)
+            | Self::Directory { value, .. }
+            | Self::NameOrDirectory { value, .. } => value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SelectorBase {
+    CurrentDirectory,
+    WorktreeRoot,
 }
 
 fn deliver_directly(arguments: Vec<String>) -> Vec<String> {
@@ -192,6 +273,17 @@ enum ErrorKind {
         invocation: &'static str,
         source: package_json::Error,
     },
+    MissingPackageTarget {
+        invocation: &'static str,
+        option: &'static str,
+    },
+    MultiplePackageTargets {
+        invocation: &'static str,
+    },
+    NonExactPackageTarget {
+        invocation: &'static str,
+        selector: OsString,
+    },
     UnsupportedSyntax {
         invocation: &'static str,
         path: PathBuf,
@@ -228,6 +320,22 @@ impl fmt::Display for Error {
             ErrorKind::Package { invocation, source } => {
                 write!(formatter, "could not isolate `{invocation}`: {source}")
             }
+            ErrorKind::MissingPackageTarget { invocation, option } => write!(
+                formatter,
+                "could not isolate `{invocation}`: `{option}` requires a package selector"
+            ),
+            ErrorKind::MultiplePackageTargets { invocation } => write!(
+                formatter,
+                "could not isolate `{invocation}`: the command may select multiple packages; Ragavan requires exactly one package"
+            ),
+            ErrorKind::NonExactPackageTarget {
+                invocation,
+                selector,
+            } => write!(
+                formatter,
+                "could not isolate `{invocation}`: package selector {:?} is not an exact package name or directory; Ragavan requires exactly one package",
+                selector.to_string_lossy()
+            ),
             ErrorKind::UnsupportedSyntax {
                 invocation,
                 path,
@@ -276,7 +384,10 @@ impl std::error::Error for Error {
             ErrorKind::Package { source, .. } => Some(source),
             ErrorKind::UnsupportedSyntax { source, .. } => Some(source),
             ErrorKind::Stack(error) => Some(error.as_ref()),
-            ErrorKind::UnsupportedScript { .. }
+            ErrorKind::MissingPackageTarget { .. }
+            | ErrorKind::MultiplePackageTargets { .. }
+            | ErrorKind::NonExactPackageTarget { .. }
+            | ErrorKind::UnsupportedScript { .. }
             | ErrorKind::AmbiguousScript { .. }
             | ErrorKind::UnsafeArgumentDelivery { .. } => None,
         }
