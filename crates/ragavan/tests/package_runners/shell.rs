@@ -1,12 +1,38 @@
-#[cfg(windows)]
-use super::harness::{normalized_arguments, write_package};
-#[cfg(windows)]
+use super::harness::{FakeCommand, normalized_arguments, write_package};
 use crate::support::{
-    ENABLED, TestRepository, assert_stdout, state_home_variable, test_state_home,
+    ENABLED, TestRepository, assert_stdout, ragavan_command, state_home_variable, test_state_home,
 };
-use crate::support::{TempDirectory, assert_success, ragavan, stderr, stdout};
+use crate::support::{TempDirectory, assert_success, ragavan, stdout};
+use std::{env, path::Path, process::Command};
+
 #[cfg(windows)]
-use std::{env, fs, path::Path, process::Command};
+use crate::support::stderr;
+#[cfg(windows)]
+use std::fs;
+
+#[test]
+fn bash_wraps_package_runners_without_owning_stack_arguments() {
+    let output = ragavan(TempDirectory::new().path(), &["hook", "bash"]);
+
+    assert_success(&output);
+    let hook = stdout(&output);
+    for (index, command) in ["bun", "npm", "pnpm"].iter().enumerate() {
+        assert!(hook.contains(&format!("$(builtin type -P {command})")));
+        assert!(hook.contains(&format!("function {command}")));
+        #[cfg(windows)]
+        assert!(hook.contains(&format!(
+            "__run '{command}' \"${{BASH}}\" '3' '-c' 'exec \"$0\" \"$@\"' \"${{__RagavanOriginalCommands[{index}]}}\" \"$@\""
+        )));
+        #[cfg(not(windows))]
+        assert!(hook.contains(&format!(
+            "__run '{command}' \"${{__RagavanOriginalCommands[{index}]}}\" '0' \"$@\""
+        )));
+    }
+    assert!(!hook.contains("function yarn"));
+    assert!(!hook.contains("__bun-arguments"));
+    assert!(!hook.contains("--port"));
+    assert!(!hook.contains("--strictPort"));
+}
 
 #[test]
 fn powershell_wraps_package_runners_without_owning_stack_arguments() {
@@ -17,7 +43,7 @@ fn powershell_wraps_package_runners_without_owning_stack_arguments() {
     for command in ["bun", "npm", "pnpm"] {
         assert!(hook.contains(&format!("function global:{command}")));
         assert!(hook.contains(&format!("__run '{command}'")));
-        assert!(hook.contains(&format!("__RagavanOriginalCommands['{command}'].Path")));
+        assert!(hook.contains(&format!("__RagavanOriginalCommands['{command}'].Path '0'")));
     }
     assert!(!hook.contains("function global:yarn"));
     assert!(!hook.contains("ExternalScript"));
@@ -28,13 +54,32 @@ fn powershell_wraps_package_runners_without_owning_stack_arguments() {
 }
 
 #[test]
-fn outdated_powershell_hooks_fail_with_a_reload_instruction() {
-    let output = ragavan(TempDirectory::new().path(), &["__bun-arguments", "dev"]);
+fn launch_arguments_wrap_without_changing_the_package_command() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+    let program = FakeCommand::printing("bun");
 
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(stdout(&output), "", "{output:?}");
-    assert!(stderr(&output).contains("loaded PowerShell integration is outdated"));
-    assert!(stderr(&output).contains("ragavan hook powershell"));
+    let output = ragavan_command(repository.path())
+        .arg("__run")
+        .arg("bun")
+        .arg(program.path())
+        .arg("2")
+        .args(["launch-one", "launch-two", "dev"])
+        .output()
+        .expect("Ragavan should run the package manager");
+
+    assert_eq!(
+        normalized_arguments(output),
+        [
+            "launch-one",
+            "launch-two",
+            "dev",
+            "--port",
+            "<port>",
+            "--strictPort",
+        ]
+    );
 }
 
 #[cfg(windows)]
@@ -100,6 +145,72 @@ fn powershell_adapts_package_runners_and_preserves_other_commands() {
         .env(state_home_variable(), test_state_home(repository.path()))
         .output()
         .expect("PowerShell should start");
+
+    assert_eq!(
+        normalized_arguments(output),
+        [
+            "dev",
+            "--port",
+            "<port>",
+            "--strictPort",
+            "run",
+            "dev",
+            "--",
+            "--port",
+            "<port>",
+            "--strictPort",
+            "dev",
+            "--port",
+            "<port>",
+            "--strictPort",
+            "test",
+            "--watch",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_adapts_package_runners_and_preserves_other_commands() {
+    let repository = TestRepository::new();
+    write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+
+    let fake_commands = [
+        FakeCommand::printing("bun"),
+        FakeCommand::printing("npm"),
+        FakeCommand::printing("pnpm"),
+    ];
+    let ragavan_executable = Path::new(env!("CARGO_BIN_EXE_ragavan"));
+    let ragavan_directory = ragavan_executable
+        .parent()
+        .expect("Ragavan test executable should have a parent directory");
+    let mut command_paths: Vec<_> = fake_commands
+        .iter()
+        .map(|command| {
+            command
+                .path()
+                .parent()
+                .expect("fake command should have a parent")
+                .to_owned()
+        })
+        .collect();
+    command_paths.push(ragavan_directory.to_owned());
+    command_paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+    let command_path = env::join_paths(command_paths).expect("test PATH should be valid");
+
+    let output = Command::new("bash")
+        .current_dir(repository.path())
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            "eval \"$(ragavan hook bash)\" || exit; bun dev || exit; npm run dev || exit; pnpm dev || exit; npm test --watch",
+        ])
+        .env("PATH", command_path)
+        .env(state_home_variable(), test_state_home(repository.path()))
+        .output()
+        .expect("Bash should start");
 
     assert_eq!(
         normalized_arguments(output),

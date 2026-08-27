@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod bash;
+mod detection;
 mod powershell;
+mod profile;
 
 use std::{
     ffi::{OsStr, OsString},
@@ -12,11 +15,11 @@ pub mod protocol {
     use super::{OsStr, OsString};
 
     pub const RUN_COMMAND: &str = "__run";
-    const OUTDATED_BUN_COMMAND: &str = "__bun-arguments";
 
     pub struct RunRequest<'a> {
         command: &'a OsStr,
-        executable: &'a OsStr,
+        program: &'a OsStr,
+        launch_arguments: &'a [OsString],
         arguments: &'a [OsString],
     }
 
@@ -25,8 +28,12 @@ pub mod protocol {
             self.command
         }
 
-        pub fn executable(&self) -> &'a OsStr {
-            self.executable
+        pub fn program(&self) -> &'a OsStr {
+            self.program
+        }
+
+        pub fn launch_arguments(&self) -> &'a [OsString] {
+            self.launch_arguments
         }
 
         pub fn arguments(&self) -> &'a [OsString] {
@@ -38,82 +45,247 @@ pub mod protocol {
         let Some((operation, arguments)) = arguments.split_first() else {
             return Ok(None);
         };
-        if operation == OUTDATED_BUN_COMMAND {
-            return Err(
-                "the loaded PowerShell integration is outdated; open a new PowerShell session or reload it with `Invoke-Expression (ragavan hook powershell | Out-String)`",
-            );
-        }
         if operation != RUN_COMMAND {
             return Ok(None);
         }
 
-        match arguments {
-            [command, executable, arguments @ ..]
-                if !command.is_empty() && !executable.is_empty() =>
-            {
-                Ok(Some(RunRequest {
-                    command,
-                    executable,
-                    arguments,
-                }))
+        let [command, program, launch_argument_count, remaining @ ..] = arguments else {
+            return Err("the loaded shell integration sent a malformed command to Ragavan");
+        };
+        let Some(launch_argument_count) = launch_argument_count
+            .to_str()
+            .and_then(|count| count.parse::<usize>().ok())
+        else {
+            return Err("the loaded shell integration sent a malformed command to Ragavan");
+        };
+        if command.is_empty() || program.is_empty() || launch_argument_count > remaining.len() {
+            return Err("the loaded shell integration sent a malformed command to Ragavan");
+        }
+        let (launch_arguments, arguments) = remaining.split_at(launch_argument_count);
+
+        Ok(Some(RunRequest {
+            command,
+            program,
+            launch_arguments,
+            arguments,
+        }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn separates_launch_arguments_from_command_arguments() {
+            let arguments = [
+                OsString::from(RUN_COMMAND),
+                OsString::from("runner"),
+                OsString::from("shell"),
+                OsString::from("2"),
+                OsString::from("launch-one"),
+                OsString::from("launch-two"),
+                OsString::from("command-one"),
+                OsString::from("command-two"),
+            ];
+
+            let request = parse(&arguments)
+                .expect("the protocol should be valid")
+                .expect("the run command should be recognized");
+
+            assert_eq!(request.command(), "runner");
+            assert_eq!(request.program(), "shell");
+            assert_eq!(request.launch_arguments(), ["launch-one", "launch-two"]);
+            assert_eq!(request.arguments(), ["command-one", "command-two"]);
+        }
+
+        #[test]
+        fn rejects_invalid_launch_argument_boundaries() {
+            for arguments in [
+                vec![RUN_COMMAND, "runner", "program", "not-a-count"],
+                vec![RUN_COMMAND, "runner", "program", "1"],
+            ] {
+                let arguments: Vec<_> = arguments.into_iter().map(OsString::from).collect();
+                assert!(parse(&arguments).is_err());
             }
-            _ => Err("the loaded shell integration sent an incomplete command to Ragavan"),
         }
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct Shell(&'static Adapter);
+
+impl Shell {
+    pub fn name(self) -> &'static str {
+        self.0.name
+    }
+
+    pub fn display_name(self) -> &'static str {
+        self.0.display_name
+    }
+
+    pub fn activation_command(self) -> &'static str {
+        self.0.activation_command
+    }
+}
+
+impl fmt::Debug for Shell {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("Shell").field(&self.name()).finish()
+    }
+}
+
+impl PartialEq for Shell {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
+impl Eq for Shell {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShellTarget {
     Current,
-    PowerShell,
+    Explicit(Shell),
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum InstallOutcome {
-    Installed { profile: PathBuf },
-    AlreadyInstalled { profile: PathBuf },
+    Installed { shell: Shell, profile: PathBuf },
+    AlreadyInstalled { shell: Shell, profile: PathBuf },
 }
 
 impl InstallOutcome {
+    pub const fn shell(&self) -> Shell {
+        match self {
+            Self::Installed { shell, .. } | Self::AlreadyInstalled { shell, .. } => *shell,
+        }
+    }
+
     pub fn profile(&self) -> &Path {
         match self {
-            Self::Installed { profile } | Self::AlreadyInstalled { profile } => profile,
+            Self::Installed { profile, .. } | Self::AlreadyInstalled { profile, .. } => profile,
         }
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum UninstallOutcome {
-    Uninstalled { profile: PathBuf },
-    AlreadyUninstalled { profile: PathBuf },
+    Uninstalled { shell: Shell, profile: PathBuf },
+    AlreadyUninstalled { shell: Shell, profile: PathBuf },
 }
 
 impl UninstallOutcome {
+    pub const fn shell(&self) -> Shell {
+        match self {
+            Self::Uninstalled { shell, .. } | Self::AlreadyUninstalled { shell, .. } => *shell,
+        }
+    }
+
     pub fn profile(&self) -> &Path {
         match self {
-            Self::Uninstalled { profile } | Self::AlreadyUninstalled { profile } => profile,
+            Self::Uninstalled { profile, .. } | Self::AlreadyUninstalled { profile, .. } => profile,
         }
     }
 }
 
+type AdapterError = Box<dyn std::error::Error>;
+
+struct ProfileEdit {
+    profile: PathBuf,
+    changed: bool,
+}
+
+struct Adapter {
+    name: &'static str,
+    display_name: &'static str,
+    activation_command: &'static str,
+    matches: fn(&Path) -> bool,
+    install: fn(&Selection) -> Result<ProfileEdit, AdapterError>,
+    uninstall: fn(&Selection) -> Result<ProfileEdit, AdapterError>,
+    hook: fn(&[&str]) -> String,
+}
+
+static ADAPTERS: &[Adapter] = &[bash::ADAPTER, powershell::ADAPTER];
+
+pub fn shells() -> impl ExactSizeIterator<Item = Shell> + Clone {
+    ADAPTERS.iter().map(Shell)
+}
+
+pub fn shell(name: &str) -> Option<Shell> {
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.name == name)
+        .map(Shell)
+}
+
 pub fn install(target: ShellTarget) -> Result<InstallOutcome, Error> {
-    resolve(target)?.install().map_err(Error::powershell)
+    let resolved = resolve(target)?;
+    let edit = (resolved.adapter.install)(&resolved.selection).map_err(Error::adapter)?;
+
+    if edit.changed {
+        Ok(InstallOutcome::Installed {
+            shell: Shell(resolved.adapter),
+            profile: edit.profile,
+        })
+    } else {
+        Ok(InstallOutcome::AlreadyInstalled {
+            shell: Shell(resolved.adapter),
+            profile: edit.profile,
+        })
+    }
 }
 
 pub fn uninstall(target: ShellTarget) -> Result<UninstallOutcome, Error> {
-    resolve(target)?.uninstall().map_err(Error::powershell)
+    let resolved = resolve(target)?;
+    let edit = (resolved.adapter.uninstall)(&resolved.selection).map_err(Error::adapter)?;
+
+    if edit.changed {
+        Ok(UninstallOutcome::Uninstalled {
+            shell: Shell(resolved.adapter),
+            profile: edit.profile,
+        })
+    } else {
+        Ok(UninstallOutcome::AlreadyUninstalled {
+            shell: Shell(resolved.adapter),
+            profile: edit.profile,
+        })
+    }
 }
 
-pub fn powershell_hook<'a>(commands: impl IntoIterator<Item = &'a str>) -> String {
-    powershell::hook(commands)
+pub fn hook<'a>(shell: Shell, commands: impl IntoIterator<Item = &'a str>) -> String {
+    let commands: Vec<_> = commands.into_iter().collect();
+    (shell.0.hook)(&commands)
 }
 
-fn resolve(target: ShellTarget) -> Result<powershell::PowerShell, Error> {
+struct ResolvedAdapter {
+    adapter: &'static Adapter,
+    selection: Selection,
+}
+
+enum Selection {
+    Detected { executable: PathBuf },
+    Explicit,
+}
+
+fn resolve(target: ShellTarget) -> Result<ResolvedAdapter, Error> {
     match target {
-        ShellTarget::Current => powershell::PowerShell::current()
-            .map_err(Error::powershell)?
-            .ok_or_else(Error::unsupported_current_shell),
-        ShellTarget::PowerShell => powershell::PowerShell::available().map_err(Error::powershell),
+        ShellTarget::Current => {
+            let process = detection::current().map_err(Error::detection)?;
+            let adapter = ADAPTERS
+                .iter()
+                .find(|adapter| (adapter.matches)(process.command()))
+                .ok_or_else(Error::unsupported_current_shell)?;
+            Ok(ResolvedAdapter {
+                adapter,
+                selection: Selection::Detected {
+                    executable: process.into_executable(),
+                },
+            })
+        }
+        ShellTarget::Explicit(shell) => Ok(ResolvedAdapter {
+            adapter: shell.0,
+            selection: Selection::Explicit,
+        }),
     }
 }
 
@@ -123,7 +295,8 @@ pub struct Error(ErrorKind);
 #[derive(Debug)]
 enum ErrorKind {
     UnsupportedCurrentShell,
-    PowerShell(powershell::Error),
+    Detection(detection::Error),
+    Adapter(AdapterError),
 }
 
 impl Error {
@@ -131,18 +304,36 @@ impl Error {
         Self(ErrorKind::UnsupportedCurrentShell)
     }
 
-    fn powershell(error: powershell::Error) -> Self {
-        Self(ErrorKind::PowerShell(error))
+    fn detection(error: detection::Error) -> Self {
+        Self(ErrorKind::Detection(error))
+    }
+
+    fn adapter(source: AdapterError) -> Self {
+        Self(ErrorKind::Adapter(source))
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
-            ErrorKind::UnsupportedCurrentShell => formatter.write_str(
-                "could not detect a supported current shell; rerun the command with `powershell`",
-            ),
-            ErrorKind::PowerShell(error) => error.fmt(formatter),
+            ErrorKind::UnsupportedCurrentShell => {
+                formatter.write_str(
+                    "could not detect a supported current shell; rerun the command with ",
+                )?;
+                for (index, adapter) in ADAPTERS.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(if index + 1 == ADAPTERS.len() {
+                            " or "
+                        } else {
+                            ", "
+                        })?;
+                    }
+                    write!(formatter, "`{}`", adapter.name)?;
+                }
+                Ok(())
+            }
+            ErrorKind::Detection(error) => error.fmt(formatter),
+            ErrorKind::Adapter(source) => source.fmt(formatter),
         }
     }
 }
@@ -151,7 +342,25 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.0 {
             ErrorKind::UnsupportedCurrentShell => None,
-            ErrorKind::PowerShell(error) => Some(error),
+            ErrorKind::Detection(error) => Some(error),
+            ErrorKind::Adapter(source) => Some(source.as_ref()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn every_advertised_shell_has_one_round_trippable_name() {
+        let mut names = HashSet::new();
+
+        for registered in shells() {
+            assert!(names.insert(registered.name()));
+            assert_eq!(shell(registered.name()), Some(registered));
+        }
+        assert!(!names.is_empty());
     }
 }

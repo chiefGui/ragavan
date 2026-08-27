@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use clap::{
+    CommandFactory, Parser, Subcommand,
+    builder::{PossibleValuesParser, TypedValueParser},
+    error::ErrorKind,
+};
 use ragavan_core::{Enrollment, LaunchPlan, ServiceIdentity};
 use serde_json::{Value, json};
 use std::{
@@ -43,10 +47,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
     };
 
     let outcome = match command {
-        Command::Install { shell } => ragavan_shell::install(Shell::target(shell))
+        Command::Install { shell } => ragavan_shell::install(shell_target(shell))
             .map(Outcome::Installation)
             .map_err(Failure::from),
-        Command::Uninstall { shell } => ragavan_shell::uninstall(Shell::target(shell))
+        Command::Uninstall { shell } => ragavan_shell::uninstall(shell_target(shell))
             .map(Outcome::Uninstallation)
             .map_err(Failure::from),
         Command::Enable => ragavan_git::enable()
@@ -58,9 +62,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
         Command::Disable => ragavan_git::disable()
             .map(Outcome::Enrollment)
             .map_err(Failure::from),
-        Command::Hook {
-            shell: Shell::PowerShell,
-        } => {
+        Command::Hook { shell } => {
             if format == OutputFormat::Json {
                 return report_usage(
                     "structured output is unavailable for `hook`; its output is the shell integration",
@@ -69,7 +71,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
             }
             print!(
                 "{}",
-                ragavan_shell::powershell_hook(ragavan_adapters::commands())
+                ragavan_shell::hook(shell, ragavan_adapters::commands())
             );
             return 0;
         }
@@ -105,14 +107,14 @@ enum Command {
     /// Install persistent integration for the current shell.
     Install {
         /// Select a shell when automatic detection is unavailable.
-        #[arg(value_enum)]
-        shell: Option<Shell>,
+        #[arg(value_parser = shell_parser())]
+        shell: Option<ragavan_shell::Shell>,
     },
     /// Remove persistent integration from the current shell.
     Uninstall {
         /// Select a shell when automatic detection is unavailable.
-        #[arg(value_enum)]
-        shell: Option<Shell>,
+        #[arg(value_parser = shell_parser())]
+        shell: Option<ragavan_shell::Shell>,
     },
     /// Enable Ragavan for the current repository.
     Enable,
@@ -122,24 +124,21 @@ enum Command {
     Disable,
     /// Print shell integration.
     Hook {
-        #[arg(value_enum)]
-        shell: Shell,
+        #[arg(value_parser = shell_parser())]
+        shell: ragavan_shell::Shell,
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Shell {
-    #[value(name = "powershell")]
-    PowerShell,
+fn shell_parser() -> impl TypedValueParser<Value = ragavan_shell::Shell> {
+    PossibleValuesParser::new(ragavan_shell::shells().map(|shell| shell.name())).map(|name| {
+        ragavan_shell::shell(&name).expect("every advertised shell must remain registered")
+    })
 }
 
-impl Shell {
-    fn target(shell: Option<Self>) -> ragavan_shell::ShellTarget {
-        match shell {
-            None => ragavan_shell::ShellTarget::Current,
-            Some(Self::PowerShell) => ragavan_shell::ShellTarget::PowerShell,
-        }
-    }
+fn shell_target(shell: Option<ragavan_shell::Shell>) -> ragavan_shell::ShellTarget {
+    shell.map_or(ragavan_shell::ShellTarget::Current, |shell| {
+        ragavan_shell::ShellTarget::Explicit(shell)
+    })
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -172,28 +171,34 @@ impl Outcome {
 
     fn json(self) -> Value {
         match self {
-            Self::Installation(outcome) => json!({
-                "schema_version": JSON_SCHEMA_VERSION,
-                "integration": {
-                    "shell": "powershell",
-                    "state": match outcome {
-                        ragavan_shell::InstallOutcome::Installed { .. } => "installed",
-                        ragavan_shell::InstallOutcome::AlreadyInstalled { .. } => "already_installed",
+            Self::Installation(outcome) => {
+                let shell = outcome.shell().name();
+                json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "integration": {
+                        "shell": shell,
+                        "state": match outcome {
+                            ragavan_shell::InstallOutcome::Installed { .. } => "installed",
+                            ragavan_shell::InstallOutcome::AlreadyInstalled { .. } => "already_installed",
+                        },
+                        "profile": outcome.profile().to_string_lossy(),
                     },
-                    "profile": outcome.profile().to_string_lossy(),
-                },
-            }),
-            Self::Uninstallation(outcome) => json!({
-                "schema_version": JSON_SCHEMA_VERSION,
-                "integration": {
-                    "shell": "powershell",
-                    "state": match outcome {
-                        ragavan_shell::UninstallOutcome::Uninstalled { .. } => "uninstalled",
-                        ragavan_shell::UninstallOutcome::AlreadyUninstalled { .. } => "already_uninstalled",
+                })
+            }
+            Self::Uninstallation(outcome) => {
+                let shell = outcome.shell().name();
+                json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "integration": {
+                        "shell": shell,
+                        "state": match outcome {
+                            ragavan_shell::UninstallOutcome::Uninstalled { .. } => "uninstalled",
+                            ragavan_shell::UninstallOutcome::AlreadyUninstalled { .. } => "already_uninstalled",
+                        },
+                        "profile": outcome.profile().to_string_lossy(),
                     },
-                    "profile": outcome.profile().to_string_lossy(),
-                },
-            }),
+                })
+            }
             Self::Enrollment(enrollment) => json!({
                 "schema_version": JSON_SCHEMA_VERSION,
                 "enrollment": match enrollment {
@@ -256,33 +261,46 @@ fn print_json_error(kind: &str, message: &str) {
 }
 
 fn print_installation(outcome: ragavan_shell::InstallOutcome) {
+    let shell = outcome.shell();
     match &outcome {
         ragavan_shell::InstallOutcome::Installed { .. } => {
-            println!("Ragavan is installed for PowerShell.");
+            println!("Ragavan is installed for {}.", shell.display_name());
         }
         ragavan_shell::InstallOutcome::AlreadyInstalled { .. } => {
-            println!("Ragavan is already installed for PowerShell.");
+            println!("Ragavan is already installed for {}.", shell.display_name());
         }
     }
     println!("Profile: {}", outcome.profile().display());
-    println!("New PowerShell sessions will load Ragavan automatically.");
     println!(
-        "To activate this session now, run `Invoke-Expression (ragavan hook powershell | Out-String)`."
+        "Future {} sessions that read this profile will load Ragavan automatically.",
+        shell.display_name()
+    );
+    println!(
+        "To activate Ragavan in an existing {} session, run `{}`.",
+        shell.display_name(),
+        shell.activation_command()
     );
 }
 
 fn print_uninstallation(outcome: ragavan_shell::UninstallOutcome) {
+    let shell = outcome.shell();
     match &outcome {
         ragavan_shell::UninstallOutcome::Uninstalled { .. } => {
-            println!("Ragavan is uninstalled from PowerShell.");
+            println!("Ragavan is uninstalled from {}.", shell.display_name());
         }
         ragavan_shell::UninstallOutcome::AlreadyUninstalled { .. } => {
-            println!("Ragavan is already uninstalled from PowerShell.");
+            println!(
+                "Ragavan is already uninstalled from {}.",
+                shell.display_name()
+            );
         }
     }
     println!("Profile: {}", outcome.profile().display());
-    println!("New PowerShell sessions will no longer load Ragavan.");
-    println!("This PowerShell session remains active until it is closed.");
+    println!(
+        "Future {} sessions will no longer load Ragavan from this profile.",
+        shell.display_name()
+    );
+    println!("Loaded integration remains active in existing sessions until they are closed.");
 }
 
 fn enrollment_message(enrollment: Enrollment) -> &'static str {
@@ -305,11 +323,13 @@ fn run_command(request: ragavan_shell::protocol::RunRequest<'_>) -> i32 {
 fn execute_command(
     request: &ragavan_shell::protocol::RunRequest<'_>,
 ) -> Result<ExitStatus, Failure> {
-    let mut command = ProcessCommand::new(request.executable());
-    command.args(request.arguments());
+    let mut command = ProcessCommand::new(request.program());
+    command
+        .args(request.launch_arguments())
+        .args(request.arguments());
     let Some((lease, plan)) = isolate_command(request.command(), request.arguments())? else {
         return command.status().map_err(|source| Failure::RunCommand {
-            executable: request.executable().to_owned(),
+            program: request.program().to_owned(),
             source,
         });
     };
@@ -360,7 +380,7 @@ enum Failure {
     Runtime(ragavan_runtime::Error),
     Shell(ragavan_shell::Error),
     RunCommand {
-        executable: OsString,
+        program: OsString,
         source: io::Error,
     },
 }
@@ -396,10 +416,10 @@ impl fmt::Display for Failure {
             Self::Adapter(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
             Self::Shell(error) => error.fmt(formatter),
-            Self::RunCommand { executable, source } => write!(
+            Self::RunCommand { program, source } => write!(
                 formatter,
                 "could not run {}: {source}",
-                std::path::Path::new(executable).display()
+                std::path::Path::new(program).display()
             ),
         }
     }

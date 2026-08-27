@@ -116,11 +116,11 @@ fn unknown_commands_are_rejected_before_repository_access() {
 #[test]
 fn unsupported_shells_are_rejected_before_installation() {
     let directory = TempDirectory::new();
-    let output = ragavan(directory.path(), &["install", "bash"]);
+    let output = ragavan(directory.path(), &["install", "zsh"]);
 
     assert_eq!(output.status.code(), Some(2), "{output:?}");
-    assert!(stderr(&output).contains("invalid value 'bash'"));
-    assert!(stderr(&output).contains("possible values: powershell"));
+    assert!(stderr(&output).contains("invalid value 'zsh'"));
+    assert!(stderr(&output).contains("possible values: bash, powershell"));
 }
 
 #[test]
@@ -130,7 +130,97 @@ fn automatic_shell_selection_refuses_to_guess() {
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(stderr(&output).contains("could not detect a supported current shell"));
-    assert!(stderr(&output).contains("with `powershell`"));
+    assert!(stderr(&output).contains("with `bash` or `powershell`"));
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_shell_selection_installs_the_parent_bash() {
+    let home = TempDirectory::new();
+    let output = Command::new("bash")
+        .current_dir(home.path())
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            "\"$RAGAVAN_TEST_EXECUTABLE\" install; status=$?; :; exit $status",
+        ])
+        .env("HOME", home.path())
+        .env("RAGAVAN_TEST_EXECUTABLE", env!("CARGO_BIN_EXE_ragavan"))
+        .output()
+        .expect("Bash should start");
+
+    assert_success(&output);
+    assert!(stdout(&output).contains("installed for Bash"));
+    assert!(
+        std::fs::read_to_string(home.path().join(".bashrc"))
+            .expect("Bash profile should be installed")
+            .contains("ragavan hook bash")
+    );
+}
+
+#[test]
+fn bash_installation_is_explicit_idempotent_and_reversible() {
+    let home = TempDirectory::new();
+    let profile = home.path().join(".bashrc");
+    let original = "alias serve=project\n";
+    std::fs::write(&profile, original).expect("Bash profile should be written");
+
+    let installed = bash_integration(home.path(), &["install", "bash", "--json"]);
+    assert_success(&installed);
+    assert_eq!(stderr(&installed), "", "{installed:?}");
+    assert_eq!(
+        json_stdout(&installed),
+        serde_json::json!({
+            "schema_version": 1,
+            "integration": {
+                "shell": "bash",
+                "state": "installed",
+                "profile": profile.to_string_lossy(),
+            },
+        })
+    );
+    let profile_text =
+        std::fs::read_to_string(&profile).expect("Bash profile should remain readable");
+    assert!(profile_text.starts_with(original));
+    assert!(profile_text.contains("ragavan hook bash"));
+
+    let repeated = bash_integration(home.path(), &["install", "bash"]);
+    assert_success(&repeated);
+    assert!(stdout(&repeated).contains("already installed for Bash"));
+    assert!(stdout(&repeated).contains("eval \"$(ragavan hook bash)\""));
+
+    let uninstalled = bash_integration(home.path(), &["uninstall", "bash", "--json"]);
+    assert_success(&uninstalled);
+    assert_eq!(
+        json_stdout(&uninstalled)["integration"]["state"],
+        "uninstalled"
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile).expect("Bash profile should remain readable"),
+        original
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn explicit_bash_installation_uses_the_windows_user_profile() {
+    let home = TempDirectory::new();
+    let profile = home.path().join(".bashrc");
+    let output = Command::new(env!("CARGO_BIN_EXE_ragavan"))
+        .current_dir(home.path())
+        .args(["install", "bash"])
+        .env_remove("HOME")
+        .env("USERPROFILE", home.path())
+        .output()
+        .expect("Ragavan should start");
+
+    assert_success(&output);
+    assert!(
+        std::fs::read_to_string(profile)
+            .expect("Bash profile should be installed")
+            .contains("ragavan hook bash")
+    );
 }
 
 #[test]
@@ -264,4 +354,13 @@ fn json_stdout(output: &std::process::Output) -> serde_json::Value {
 
 fn json_stderr(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stderr).expect("stderr should contain one JSON value")
+}
+
+fn bash_integration(home: &std::path::Path, arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ragavan"))
+        .current_dir(home)
+        .args(arguments)
+        .env("HOME", home)
+        .output()
+        .expect("Ragavan should start")
 }

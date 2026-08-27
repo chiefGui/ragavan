@@ -1,4 +1,3 @@
-use super::Error;
 use std::{
     ffi::OsString,
     fmt, fs,
@@ -8,12 +7,27 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(test)]
+mod tests;
+
 const START_MARKER: &str = "# >>> ragavan >>>";
 const END_MARKER: &str = "# <<< ragavan <<<";
 
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) struct Profile {
+pub(super) fn install(path: &Path, integration: &[&str]) -> Result<bool, Error> {
+    let mut profile = Profile::read(path)?.unwrap_or_else(|| Profile::empty(path));
+    profile.apply(integration)
+}
+
+pub(super) fn uninstall(path: &Path) -> Result<bool, Error> {
+    let Some(mut profile) = Profile::read(path)? else {
+        return Ok(false);
+    };
+    profile.remove()
+}
+
+struct Profile {
     path: PathBuf,
     original: Option<Vec<u8>>,
     text: String,
@@ -21,7 +35,7 @@ pub(super) struct Profile {
 }
 
 impl Profile {
-    pub(super) fn read(path: &Path) -> Result<Option<Self>, Error> {
+    fn read(path: &Path) -> Result<Option<Self>, Error> {
         let storage_path = storage_path(path)?;
         let bytes = match fs::read(&storage_path) {
             Ok(bytes) => bytes,
@@ -46,7 +60,7 @@ impl Profile {
         }))
     }
 
-    pub(super) fn empty(path: &Path) -> Self {
+    fn empty(path: &Path) -> Self {
         Self {
             path: path.to_owned(),
             original: None,
@@ -55,13 +69,13 @@ impl Profile {
         }
     }
 
-    pub(super) fn install(&mut self) -> Result<bool, Error> {
-        let integration = integration_range(&self.text).map_err(|()| Error::MalformedProfile {
+    fn apply(&mut self, integration: &[&str]) -> Result<bool, Error> {
+        let range = integration_range(&self.text).map_err(|()| Error::MalformedProfile {
             path: self.path.clone(),
         })?;
         let newline = preferred_newline(&self.text);
-        let block = integration_block(newline);
-        let range = integration.unwrap_or(self.text.len()..self.text.len());
+        let block = integration_block(newline, integration);
+        let range = range.unwrap_or(self.text.len()..self.text.len());
         let prefix = &self.text[..range.start];
         let suffix = &self.text[range.end..];
         let mut updated =
@@ -81,7 +95,7 @@ impl Profile {
         Ok(true)
     }
 
-    pub(super) fn uninstall(&mut self) -> Result<bool, Error> {
+    fn remove(&mut self) -> Result<bool, Error> {
         let Some(range) = integration_range(&self.text).map_err(|()| Error::MalformedProfile {
             path: self.path.clone(),
         })?
@@ -186,19 +200,22 @@ fn preferred_newline(text: &str) -> &'static str {
     )
 }
 
-fn integration_block(newline: &str) -> String {
-    [
-        START_MARKER,
-        "# Managed by Ragavan. Run `ragavan uninstall` to remove.",
-        "$__RagavanBootstrapCommand = Get-Command ragavan -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1",
-        "if ($null -ne $__RagavanBootstrapCommand) {",
-        "    Invoke-Expression (& $__RagavanBootstrapCommand hook powershell | Out-String)",
-        "}",
-        "Remove-Variable __RagavanBootstrapCommand -ErrorAction SilentlyContinue",
-        END_MARKER,
-        "",
-    ]
-    .join(newline)
+fn integration_block(newline: &str, integration: &[&str]) -> String {
+    let mut block = String::with_capacity(
+        START_MARKER.len()
+            + END_MARKER.len()
+            + integration.iter().map(|line| line.len()).sum::<usize>()
+            + newline.len() * (integration.len() + 2),
+    );
+    for line in [START_MARKER]
+        .into_iter()
+        .chain(integration.iter().copied())
+        .chain([END_MARKER])
+    {
+        block.push_str(line);
+        block.push_str(newline);
+    }
+    block
 }
 
 fn write_atomically(path: &Path, original: Option<&[u8]>, bytes: &[u8]) -> Result<(), Error> {
@@ -376,7 +393,7 @@ fn encode_utf16(text: &str, bom: [u8; 2], encode: fn(u16) -> [u8; 2]) -> Vec<u8>
 }
 
 #[derive(Debug)]
-pub(crate) enum DecodeError {
+pub(super) enum DecodeError {
     Utf8(std::str::Utf8Error),
     Utf16(std::string::FromUtf16Error),
     OddUtf16ByteCount,
@@ -400,6 +417,61 @@ impl std::error::Error for DecodeError {
             Self::Utf8(source) => Some(source),
             Self::Utf16(source) => Some(source),
             Self::OddUtf16ByteCount => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum Error {
+    InvalidProfilePath { path: PathBuf },
+    ReadProfile { path: PathBuf, source: io::Error },
+    DecodeProfile { path: PathBuf, source: DecodeError },
+    MalformedProfile { path: PathBuf },
+    ProfileChanged { path: PathBuf },
+    WriteProfile { path: PathBuf, source: io::Error },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidProfilePath { path } => write!(
+                formatter,
+                "could not update profile: {} is not a file path",
+                path.display()
+            ),
+            Self::ReadProfile { path, source } => {
+                write!(formatter, "could not read {}: {source}", path.display())
+            }
+            Self::DecodeProfile { path, source } => write!(
+                formatter,
+                "could not safely edit {} because its text encoding is unsupported: {source}",
+                path.display()
+            ),
+            Self::MalformedProfile { path } => write!(
+                formatter,
+                "could not safely edit {} because its Ragavan markers are incomplete, duplicated, or out of order",
+                path.display()
+            ),
+            Self::ProfileChanged { path } => write!(
+                formatter,
+                "could not update {} because it changed while Ragavan was editing it; rerun the command",
+                path.display()
+            ),
+            Self::WriteProfile { path, source } => {
+                write!(formatter, "could not update {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadProfile { source, .. } | Self::WriteProfile { source, .. } => Some(source),
+            Self::DecodeProfile { source, .. } => Some(source),
+            Self::InvalidProfilePath { .. }
+            | Self::MalformedProfile { .. }
+            | Self::ProfileChanged { .. } => None,
         }
     }
 }

@@ -83,6 +83,7 @@ fn unrelated_commands_take_the_direct_pass_through_path() {
             .arg("__run")
             .arg("npm")
             .arg(executable.path())
+            .arg("0")
             .args(arguments)
             .env("PATH", "")
             .output()
