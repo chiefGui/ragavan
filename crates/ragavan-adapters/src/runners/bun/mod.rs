@@ -1,4 +1,5 @@
-use crate::{DevelopmentCommand, PackageTarget, Runner, deliver_directly};
+use super::{Runner, deliver_directly};
+use crate::{DevelopmentCommand, package::PackageTarget};
 use std::ffi::OsString;
 
 pub(super) const ADAPTER: Runner = Runner {

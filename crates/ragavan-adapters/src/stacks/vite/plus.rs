@@ -1,9 +1,7 @@
-use crate::{Invocation, Stack, vite};
+use super::adjust;
+use crate::{script::Invocation, stacks::Stack};
 
-pub(super) const ADAPTER: Stack = Stack {
-    recognize,
-    adjust: vite::adjust,
-};
+pub(in crate::stacks) const ADAPTER: Stack = Stack { recognize, adjust };
 
 fn recognize(invocation: &Invocation) -> bool {
     invocation.invokes("vp")

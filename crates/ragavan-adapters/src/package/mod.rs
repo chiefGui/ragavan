@@ -1,4 +1,7 @@
-use crate::{PackageSelector, SelectorBase};
+mod target;
+
+pub(super) use target::{PackageSelector, PackageTarget, SelectorBase};
+
 use ragavan_core::{ServiceScope, ServiceScopeError};
 use std::{
     env,
@@ -6,6 +9,22 @@ use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
 };
+
+pub(super) fn find_script(
+    worktree_root: &Path,
+    target: PackageTarget<'_>,
+    script_name: &str,
+) -> Result<PackageScript, Error> {
+    match target {
+        PackageTarget::CurrentDirectory => find_nearest_script(worktree_root, script_name),
+        PackageTarget::Selected(selector) => {
+            find_selected_script(worktree_root, selector, script_name)
+        }
+        PackageTarget::MissingValue(option) => Err(Error::MissingTargetValue(option)),
+        PackageTarget::Multiple => Err(Error::MultipleTargets),
+        PackageTarget::NonExact(selector) => Err(Error::NonExactTarget(selector.to_owned())),
+    }
+}
 
 pub(super) struct PackageScript {
     path: PathBuf,
@@ -19,16 +38,13 @@ impl PackageScript {
     }
 }
 
-pub(super) fn find_nearest_script(
-    worktree_root: &Path,
-    script_name: &str,
-) -> Result<PackageScript, Error> {
+fn find_nearest_script(worktree_root: &Path, script_name: &str) -> Result<PackageScript, Error> {
     let resolved_worktree_root = resolve_path(worktree_root)?;
     let package_path = nearest_package_json(worktree_root, &resolved_worktree_root)?;
     read_script(&resolved_worktree_root, package_path, script_name)
 }
 
-pub(super) fn find_selected_script(
+fn find_selected_script(
     worktree_root: &Path,
     selector: PackageSelector<'_>,
     script_name: &str,
@@ -360,6 +376,9 @@ fn package_has_name(path: &Path, selected_name: &str) -> Result<bool, Error> {
 
 #[derive(Debug)]
 pub(super) enum Error {
+    MissingTargetValue(&'static str),
+    MultipleTargets,
+    NonExactTarget(OsString),
     CurrentDirectory(io::Error),
     ResolvePath {
         path: PathBuf,
@@ -416,6 +435,17 @@ pub(super) enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingTargetValue(option) => {
+                write!(formatter, "`{option}` requires a package selector")
+            }
+            Self::MultipleTargets => formatter.write_str(
+                "the command may select multiple packages; Ragavan requires exactly one package",
+            ),
+            Self::NonExactTarget(selector) => write!(
+                formatter,
+                "package selector {:?} is not an exact package name or directory; Ragavan requires exactly one package",
+                selector.to_string_lossy()
+            ),
             Self::CurrentDirectory(source) => {
                 write!(formatter, "could not read the current directory: {source}")
             }

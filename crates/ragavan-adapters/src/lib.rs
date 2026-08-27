@@ -1,38 +1,22 @@
 #![forbid(unsafe_code)]
 
-mod bun;
-mod npm;
-mod package_json;
-mod pnpm;
+mod package;
+mod runners;
 mod script;
-mod vite;
-mod vite_plus;
+mod stacks;
 
+use package::PackageTarget;
 use ragavan_core::{LaunchPlan, Port, ServiceScope};
-use script::{Invocation, Script};
+use script::Script;
 use std::{
     ffi::{OsStr, OsString},
     fmt,
     path::{Path, PathBuf},
 };
 
-struct Runner {
-    command: &'static str,
-    recognize: for<'a> fn(&'a [OsString]) -> Option<DevelopmentCommand<'a>>,
-}
-
-struct Stack {
-    recognize: fn(&Invocation) -> bool,
-    adjust: fn(&Invocation, &[OsString], &'static str) -> Result<StackAdjustment, Error>,
-}
-
-const RUNNERS: &[Runner] = &[bun::ADAPTER, npm::ADAPTER, pnpm::ADAPTER];
-
-const STACKS: &[Stack] = &[vite::ADAPTER, vite_plus::ADAPTER];
-
 /// Commands for which the shell should install transparent interception.
 pub fn commands() -> impl Iterator<Item = &'static str> {
-    RUNNERS.iter().map(|runner| runner.command)
+    runners::commands()
 }
 
 /// Recognize a registered package runner's development command without inspecting the project.
@@ -40,10 +24,7 @@ pub fn development_command<'a>(
     command: &OsStr,
     arguments: &'a [OsString],
 ) -> Option<DevelopmentCommand<'a>> {
-    let command = command.to_str()?;
-    let runner = RUNNERS.iter().find(|runner| runner.command == command)?;
-
-    (runner.recognize)(arguments)
+    runners::recognize(command, arguments)
 }
 
 /// A package-script development command that may require isolation.
@@ -74,37 +55,15 @@ impl<'a> DevelopmentCommand<'a> {
 
     /// Resolve the package service and describe its port-specific adjustment.
     pub fn resolve(self, worktree_root: &Path) -> Result<IsolationPlan, Error> {
-        let package_script = match self.package_target {
-            PackageTarget::CurrentDirectory => {
-                package_json::find_nearest_script(worktree_root, self.script_name)
-            }
-            PackageTarget::Selected(selector) => {
-                package_json::find_selected_script(worktree_root, selector, self.script_name)
-            }
-            PackageTarget::MissingValue(option) => {
-                return Err(Error(ErrorKind::MissingPackageTarget {
-                    invocation: self.invocation,
-                    option,
-                }));
-            }
-            PackageTarget::Multiple => {
-                return Err(Error(ErrorKind::MultiplePackageTargets {
-                    invocation: self.invocation,
-                }));
-            }
-            PackageTarget::NonExact(selector) => {
-                return Err(Error(ErrorKind::NonExactPackageTarget {
-                    invocation: self.invocation,
-                    selector: selector.to_owned(),
-                }));
-            }
-        }
-        .map_err(|source| {
-            Error(ErrorKind::Package {
-                invocation: self.invocation,
-                source,
-            })
-        })?;
+        let package_script =
+            package::find_script(worktree_root, self.package_target, self.script_name).map_err(
+                |source| {
+                    Error(ErrorKind::Package {
+                        invocation: self.invocation,
+                        source,
+                    })
+                },
+            )?;
         let (package_path, service_scope, source) = package_script.into_parts();
         let script = match Script::parse(&source) {
             Ok(script) => script,
@@ -118,116 +77,20 @@ impl<'a> DevelopmentCommand<'a> {
             }
         };
 
-        resolve_stack(ResolvedScript {
+        let adjustment = stacks::resolve(stacks::ResolvedScript {
             invocation: self.invocation,
             package_path,
-            service_scope,
             source,
             script,
             arguments: self.forwarded_arguments,
+        })
+        .map_err(|source| Error(ErrorKind::Stack(source)))?;
+        Ok(IsolationPlan {
+            service_scope,
+            port_arguments: adjustment.port_arguments,
             deliver_arguments: self.deliver_arguments,
         })
     }
-}
-
-#[derive(Clone, Copy)]
-enum PackageTarget<'a> {
-    CurrentDirectory,
-    Selected(PackageSelector<'a>),
-    MissingValue(&'static str),
-    Multiple,
-    NonExact(&'a OsStr),
-}
-
-impl<'a> PackageTarget<'a> {
-    fn select(&mut self, selector: PackageSelector<'a>, option: &'static str) {
-        if selector.value().is_empty() {
-            *self = Self::MissingValue(option);
-            return;
-        }
-
-        *self = match *self {
-            Self::CurrentDirectory => Self::Selected(selector),
-            Self::Selected(existing) if existing == selector => *self,
-            Self::MissingValue(_) => *self,
-            Self::Selected(_) | Self::Multiple | Self::NonExact(_) => Self::Multiple,
-        };
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum PackageSelector<'a> {
-    Name(&'a OsStr),
-    Directory {
-        value: &'a OsStr,
-        relative_to: SelectorBase,
-    },
-    NameOrDirectory {
-        value: &'a OsStr,
-        relative_to: SelectorBase,
-    },
-}
-
-impl<'a> PackageSelector<'a> {
-    fn value(self) -> &'a OsStr {
-        match self {
-            Self::Name(value)
-            | Self::Directory { value, .. }
-            | Self::NameOrDirectory { value, .. } => value,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SelectorBase {
-    CurrentDirectory,
-    WorktreeRoot,
-}
-
-fn deliver_directly(arguments: Vec<String>) -> Vec<String> {
-    arguments
-}
-
-fn resolve_stack(script: ResolvedScript<'_>) -> Result<IsolationPlan, Error> {
-    let mut recognized = None;
-
-    for (index, invocation) in script.script.invocations().iter().enumerate() {
-        for stack in STACKS {
-            if !(stack.recognize)(invocation) {
-                continue;
-            }
-            if recognized.is_some() {
-                return Err(Error(ErrorKind::AmbiguousScript {
-                    invocation: script.invocation,
-                    path: script.package_path,
-                    script: script.source,
-                }));
-            }
-            recognized = Some((index, invocation, stack));
-        }
-    }
-
-    let Some((index, invocation, stack)) = recognized else {
-        return Err(Error(ErrorKind::UnsupportedScript {
-            invocation: script.invocation,
-            path: script.package_path,
-            script: script.source,
-        }));
-    };
-    if index != script.script.invocations().len() - 1 {
-        return Err(Error(ErrorKind::UnsafeArgumentDelivery {
-            invocation: script.invocation,
-            path: script.package_path,
-            script: script.source,
-        }));
-    }
-
-    let stack_adjustment = (stack.adjust)(invocation, script.arguments, script.invocation)?;
-    Ok(IsolationPlan {
-        service_scope: script.service_scope,
-        port_arguments: stack_adjustment.port_arguments,
-        deliver_arguments: script.deliver_arguments,
-    })
 }
 
 /// A recognized development command's resolved service and launch adjustment.
@@ -250,20 +113,6 @@ impl IsolationPlan {
     }
 }
 
-struct StackAdjustment {
-    port_arguments: fn(Port) -> Vec<String>,
-}
-
-struct ResolvedScript<'a> {
-    invocation: &'static str,
-    package_path: PathBuf,
-    service_scope: ServiceScope,
-    source: String,
-    script: script::Script,
-    arguments: &'a [OsString],
-    deliver_arguments: fn(Vec<String>) -> Vec<String>,
-}
-
 #[derive(Debug)]
 pub struct Error(ErrorKind);
 
@@ -271,18 +120,7 @@ pub struct Error(ErrorKind);
 enum ErrorKind {
     Package {
         invocation: &'static str,
-        source: package_json::Error,
-    },
-    MissingPackageTarget {
-        invocation: &'static str,
-        option: &'static str,
-    },
-    MultiplePackageTargets {
-        invocation: &'static str,
-    },
-    NonExactPackageTarget {
-        invocation: &'static str,
-        selector: OsString,
+        source: package::Error,
     },
     UnsupportedSyntax {
         invocation: &'static str,
@@ -290,28 +128,7 @@ enum ErrorKind {
         script: String,
         source: script::Error,
     },
-    Stack(Box<dyn std::error::Error>),
-    UnsupportedScript {
-        invocation: &'static str,
-        path: PathBuf,
-        script: String,
-    },
-    AmbiguousScript {
-        invocation: &'static str,
-        path: PathBuf,
-        script: String,
-    },
-    UnsafeArgumentDelivery {
-        invocation: &'static str,
-        path: PathBuf,
-        script: String,
-    },
-}
-
-impl Error {
-    fn stack(error: impl std::error::Error + 'static) -> Self {
-        Self(ErrorKind::Stack(Box::new(error)))
-    }
+    Stack(stacks::Error),
 }
 
 impl fmt::Display for Error {
@@ -320,22 +137,6 @@ impl fmt::Display for Error {
             ErrorKind::Package { invocation, source } => {
                 write!(formatter, "could not isolate `{invocation}`: {source}")
             }
-            ErrorKind::MissingPackageTarget { invocation, option } => write!(
-                formatter,
-                "could not isolate `{invocation}`: `{option}` requires a package selector"
-            ),
-            ErrorKind::MultiplePackageTargets { invocation } => write!(
-                formatter,
-                "could not isolate `{invocation}`: the command may select multiple packages; Ragavan requires exactly one package"
-            ),
-            ErrorKind::NonExactPackageTarget {
-                invocation,
-                selector,
-            } => write!(
-                formatter,
-                "could not isolate `{invocation}`: package selector {:?} is not an exact package name or directory; Ragavan requires exactly one package",
-                selector.to_string_lossy()
-            ),
             ErrorKind::UnsupportedSyntax {
                 invocation,
                 path,
@@ -347,33 +148,6 @@ impl fmt::Display for Error {
                 path.display()
             ),
             ErrorKind::Stack(error) => error.fmt(formatter),
-            ErrorKind::UnsupportedScript {
-                invocation,
-                path,
-                script,
-            } => write!(
-                formatter,
-                "could not isolate `{invocation}`: {} uses unsupported script {script:?}; no stack adapter recognizes it as a development server",
-                path.display()
-            ),
-            ErrorKind::AmbiguousScript {
-                invocation,
-                path,
-                script,
-            } => write!(
-                formatter,
-                "could not isolate `{invocation}`: {} uses ambiguous script {script:?}; it contains more than one recognized development server",
-                path.display()
-            ),
-            ErrorKind::UnsafeArgumentDelivery {
-                invocation,
-                path,
-                script,
-            } => write!(
-                formatter,
-                "could not isolate `{invocation}`: {} uses unsafe script {script:?}; the development server must be the final command so the runner can deliver Ragavan's port arguments",
-                path.display()
-            ),
         }
     }
 }
@@ -383,13 +157,7 @@ impl std::error::Error for Error {
         match &self.0 {
             ErrorKind::Package { source, .. } => Some(source),
             ErrorKind::UnsupportedSyntax { source, .. } => Some(source),
-            ErrorKind::Stack(error) => Some(error.as_ref()),
-            ErrorKind::MissingPackageTarget { .. }
-            | ErrorKind::MultiplePackageTargets { .. }
-            | ErrorKind::NonExactPackageTarget { .. }
-            | ErrorKind::UnsupportedScript { .. }
-            | ErrorKind::AmbiguousScript { .. }
-            | ErrorKind::UnsafeArgumentDelivery { .. } => None,
+            ErrorKind::Stack(error) => Some(error),
         }
     }
 }

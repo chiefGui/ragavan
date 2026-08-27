@@ -1,18 +1,30 @@
-use crate::{Error as AdapterError, Invocation, Stack, StackAdjustment};
+mod plus;
+
+use super::{Error as StackError, Stack, StackAdjustment};
+use crate::script::Invocation;
 use ragavan_core::Port;
 use std::{ffi::OsString, fmt};
+
+pub(super) use plus::ADAPTER as PLUS_ADAPTER;
 
 pub(super) const ADAPTER: Stack = Stack { recognize, adjust };
 
 fn recognize(invocation: &Invocation) -> bool {
-    invocation.invokes("vite")
+    if !invocation.invokes("vite") {
+        return false;
+    }
+
+    !matches!(
+        invocation.arguments().first().map(String::as_str),
+        Some("build" | "optimize" | "-h" | "--help" | "-v" | "--version")
+    )
 }
 
-pub(super) fn adjust(
+fn adjust(
     invocation: &Invocation,
     forwarded_arguments: &[OsString],
     runner_invocation: &'static str,
-) -> Result<StackAdjustment, AdapterError> {
+) -> Result<StackAdjustment, StackError> {
     if invocation
         .arguments()
         .iter()
@@ -22,7 +34,7 @@ pub(super) fn adjust(
             .filter_map(|argument| argument.to_str())
             .any(is_port_argument)
     {
-        return Err(AdapterError::stack(Error::ExplicitPort {
+        return Err(StackError::adapter(Error::ExplicitPort {
             invocation: runner_invocation,
         }));
     }

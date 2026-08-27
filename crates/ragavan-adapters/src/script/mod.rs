@@ -21,6 +21,7 @@ impl Script {
 }
 
 pub(super) struct Invocation {
+    environment: Vec<String>,
     program: String,
     arguments: Vec<String>,
 }
@@ -50,6 +51,10 @@ impl Invocation {
 
     pub(super) fn arguments(&self) -> &[String] {
         &self.arguments
+    }
+
+    pub(super) fn defines_environment(&self, name: &str) -> bool {
+        self.environment.iter().any(|variable| variable == name)
     }
 }
 
@@ -242,15 +247,28 @@ impl<'a> Parser<'a> {
 
 impl Invocation {
     fn from_words(words: Vec<Word>, position: usize) -> Result<Self, Error> {
-        let mut words = words.into_iter().skip_while(Word::is_assignment);
-        let Some(program) = words.next() else {
-            return Err(Error::new(position, ErrorKind::MissingExecutable));
+        let mut words = words.into_iter();
+        let mut environment = Vec::new();
+        let program = loop {
+            let Some(mut word) = words.next() else {
+                return Err(Error::new(position, ErrorKind::MissingExecutable));
+            };
+            if !word.assignment {
+                break word;
+            }
+            let separator = word
+                .value
+                .find('=')
+                .expect("an environment assignment always contains `=`");
+            word.value.truncate(separator);
+            environment.push(word.value);
         };
         if program.value.is_empty() {
             return Err(Error::new(position, ErrorKind::MissingExecutable));
         }
 
         Ok(Self {
+            environment,
             program: program.value,
             arguments: words.map(|word| word.value).collect(),
         })
@@ -286,10 +304,6 @@ impl Word {
         if !self.assignment {
             self.assignment_name_possible = false;
         }
-    }
-
-    fn is_assignment(&self) -> bool {
-        self.assignment
     }
 }
 
@@ -372,6 +386,8 @@ mod tests {
         let invocations = script.invocations();
 
         assert_eq!(invocations.len(), 2);
+        assert!(invocations[0].defines_environment("MODE"));
+        assert!(!invocations[0].defines_environment("NODE_ENV"));
         assert!(invocations[0].invokes("build-tool"));
         assert_eq!(invocations[0].arguments(), ["run", "compile"]);
         assert!(invocations[1].invokes("server"));

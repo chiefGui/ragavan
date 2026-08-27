@@ -1,5 +1,7 @@
+use super::{Runner, deliver_directly};
 use crate::{
-    DevelopmentCommand, PackageSelector, PackageTarget, Runner, SelectorBase, deliver_directly,
+    DevelopmentCommand,
+    package::{PackageSelector, PackageTarget, SelectorBase},
 };
 use std::ffi::{OsStr, OsString};
 
