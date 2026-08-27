@@ -152,17 +152,63 @@ fn automatic_shell_selection_installs_the_parent_bash() {
 
     assert_success(&output);
     assert!(stdout(&output).contains("installed for Bash"));
-    assert!(
-        std::fs::read_to_string(home.path().join(".bashrc"))
-            .expect("Bash profile should be installed")
-            .contains("ragavan hook bash")
-    );
+    for profile in [".bashrc", ".profile"] {
+        assert!(
+            std::fs::read_to_string(home.path().join(profile))
+                .expect("Bash profile should be installed")
+                .contains("ragavan hook bash")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_bash_integration_loads_in_login_and_non_login_sessions() {
+    let home = TempDirectory::new();
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_ragavan"));
+    let executable_directory = executable
+        .parent()
+        .expect("Ragavan should have an executable directory");
+    std::fs::write(
+        home.path().join(".profile"),
+        "PATH=\"$RAGAVAN_TEST_BIN:$PATH\"\n",
+    )
+    .expect("test login profile should be written");
+
+    let installed = bash_integration(home.path(), &["install", "bash"]);
+    assert_success(&installed);
+
+    let path = env::join_paths(
+        std::iter::once(executable_directory.to_owned())
+            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("test PATH should be valid");
+
+    for arguments in [
+        vec!["--login", "-c", "test -n \"${__RagavanCommand:-}\""],
+        vec![
+            "--noprofile",
+            "-i",
+            "-c",
+            "test -n \"${__RagavanCommand:-}\"",
+        ],
+    ] {
+        let output = Command::new("bash")
+            .args(arguments)
+            .env("HOME", home.path())
+            .env("PATH", &path)
+            .env("RAGAVAN_TEST_BIN", executable_directory)
+            .output()
+            .expect("Bash should start");
+        assert_success(&output);
+    }
 }
 
 #[test]
 fn bash_installation_is_explicit_idempotent_and_reversible() {
     let home = TempDirectory::new();
     let profile = home.path().join(".bashrc");
+    let login_profile = home.path().join(".profile");
     let original = "alias serve=project\n";
     std::fs::write(&profile, original).expect("Bash profile should be written");
 
@@ -172,11 +218,14 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     assert_eq!(
         json_stdout(&installed),
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "integration": {
                 "shell": "bash",
                 "state": "installed",
-                "profile": profile.to_string_lossy(),
+                "profiles": [
+                    profile.to_string_lossy(),
+                    login_profile.to_string_lossy(),
+                ],
             },
         })
     );
@@ -184,6 +233,11 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
         std::fs::read_to_string(&profile).expect("Bash profile should remain readable");
     assert!(profile_text.starts_with(original));
     assert!(profile_text.contains("ragavan hook bash"));
+    assert!(
+        std::fs::read_to_string(&login_profile)
+            .expect("Bash login profile should remain readable")
+            .contains("ragavan hook bash")
+    );
 
     let repeated = bash_integration(home.path(), &["install", "bash"]);
     assert_success(&repeated);
@@ -193,12 +247,40 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     let uninstalled = bash_integration(home.path(), &["uninstall", "bash", "--json"]);
     assert_success(&uninstalled);
     assert_eq!(
-        json_stdout(&uninstalled)["integration"]["state"],
-        "uninstalled"
+        json_stdout(&uninstalled),
+        serde_json::json!({
+            "schema_version": 2,
+            "integration": {
+                "shell": "bash",
+                "state": "uninstalled",
+                "profiles": [
+                    profile.to_string_lossy(),
+                    login_profile.to_string_lossy(),
+                ],
+            },
+        })
     );
     assert_eq!(
-        std::fs::read_to_string(profile).expect("Bash profile should remain readable"),
+        std::fs::read_to_string(&profile).expect("Bash profile should remain readable"),
         original
+    );
+    assert_eq!(
+        std::fs::read_to_string(login_profile).expect("Bash login profile should remain readable"),
+        ""
+    );
+
+    let repeated = bash_integration(home.path(), &["uninstall", "bash", "--json"]);
+    assert_success(&repeated);
+    assert_eq!(
+        json_stdout(&repeated),
+        serde_json::json!({
+            "schema_version": 2,
+            "integration": {
+                "shell": "bash",
+                "state": "already_uninstalled",
+                "profiles": [],
+            },
+        })
     );
 }
 
@@ -206,7 +288,6 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
 #[test]
 fn explicit_bash_installation_uses_the_windows_user_profile() {
     let home = TempDirectory::new();
-    let profile = home.path().join(".bashrc");
     let output = Command::new(env!("CARGO_BIN_EXE_ragavan"))
         .current_dir(home.path())
         .args(["install", "bash"])
@@ -216,11 +297,13 @@ fn explicit_bash_installation_uses_the_windows_user_profile() {
         .expect("Ragavan should start");
 
     assert_success(&output);
-    assert!(
-        std::fs::read_to_string(profile)
-            .expect("Bash profile should be installed")
-            .contains("ragavan hook bash")
-    );
+    for profile in [".bashrc", ".profile"] {
+        assert!(
+            std::fs::read_to_string(home.path().join(profile))
+                .expect("Bash profile should be installed")
+                .contains("ragavan hook bash")
+        );
+    }
 }
 
 #[test]
@@ -261,7 +344,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&enabled), "", "{enabled:?}");
     assert_eq!(
         json_stdout(&enabled),
-        serde_json::json!({"schema_version": 1, "enrollment": "enabled"})
+        serde_json::json!({"schema_version": 2, "enrollment": "enabled"})
     );
 
     let status = ragavan(repository.path(), &["status", "--json"]);
@@ -269,7 +352,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&status), "", "{status:?}");
     assert_eq!(
         json_stdout(&status),
-        serde_json::json!({"schema_version": 1, "enrollment": "enabled"})
+        serde_json::json!({"schema_version": 2, "enrollment": "enabled"})
     );
 
     let disabled = ragavan(repository.path(), &["disable", "--json"]);
@@ -277,7 +360,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&disabled), "", "{disabled:?}");
     assert_eq!(
         json_stdout(&disabled),
-        serde_json::json!({"schema_version": 1, "enrollment": "disabled"})
+        serde_json::json!({"schema_version": 2, "enrollment": "disabled"})
     );
 }
 
@@ -289,7 +372,7 @@ fn json_errors_preserve_usage_and_operation_failures() {
     assert_eq!(usage.status.code(), Some(2), "{usage:?}");
     assert_eq!(stdout(&usage), "", "{usage:?}");
     let usage_error = json_stderr(&usage);
-    assert_eq!(usage_error["schema_version"], 1);
+    assert_eq!(usage_error["schema_version"], 2);
     assert_eq!(usage_error["error"]["kind"], "usage");
     assert!(
         usage_error["error"]["message"]
@@ -302,7 +385,7 @@ fn json_errors_preserve_usage_and_operation_failures() {
     assert_eq!(operation.status.code(), Some(1), "{operation:?}");
     assert_eq!(stdout(&operation), "", "{operation:?}");
     let operation_error = json_stderr(&operation);
-    assert_eq!(operation_error["schema_version"], 1);
+    assert_eq!(operation_error["schema_version"], 2);
     assert_eq!(operation_error["error"]["kind"], "operation");
     assert!(
         operation_error["error"]["message"]

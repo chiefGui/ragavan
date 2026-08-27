@@ -15,16 +15,53 @@ const END_MARKER: &str = "# <<< ragavan <<<";
 
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn install(path: &Path, integration: &[&str]) -> Result<bool, Error> {
-    let mut profile = Profile::read(path)?.unwrap_or_else(|| Profile::empty(path));
-    profile.apply(integration)
+pub(super) fn install(paths: &[PathBuf], integration: &[&str]) -> Result<Vec<PathBuf>, Error> {
+    transact(paths, |profile| profile.install(integration))
 }
 
-pub(super) fn uninstall(path: &Path) -> Result<bool, Error> {
-    let Some(mut profile) = Profile::read(path)? else {
-        return Ok(false);
-    };
-    profile.remove()
+pub(super) fn uninstall(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+    transact(paths, Profile::uninstall)
+}
+
+fn transact(
+    paths: &[PathBuf],
+    mut prepare: impl FnMut(Profile) -> Result<Option<Edit>, Error>,
+) -> Result<Vec<PathBuf>, Error> {
+    let mut changed = Vec::new();
+    let mut edits = Vec::new();
+
+    for path in paths {
+        let profile = Profile::read(path)?.unwrap_or_else(|| Profile::empty(path));
+        if let Some(edit) = prepare(profile)? {
+            changed.push(path.clone());
+            if !edits
+                .iter()
+                .any(|existing: &Edit| existing.path == edit.path)
+            {
+                edits.push(edit);
+            }
+        }
+    }
+
+    for index in 0..edits.len() {
+        if let Err(source) = edits[index].commit() {
+            let rollback: Vec<_> = edits[..index]
+                .iter()
+                .rev()
+                .filter_map(|edit| edit.rollback().err())
+                .collect();
+            return Err(if rollback.is_empty() {
+                source
+            } else {
+                Error::RollbackFailed {
+                    source: Box::new(source),
+                    rollback,
+                }
+            });
+        }
+    }
+
+    Ok(changed)
 }
 
 struct Profile {
@@ -69,7 +106,7 @@ impl Profile {
         }
     }
 
-    fn apply(&mut self, integration: &[&str]) -> Result<bool, Error> {
+    fn install(self, integration: &[&str]) -> Result<Option<Edit>, Error> {
         let range = integration_range(&self.text).map_err(|()| Error::MalformedProfile {
             path: self.path.clone(),
         })?;
@@ -88,19 +125,18 @@ impl Profile {
         updated.push_str(suffix);
 
         if updated == self.text {
-            return Ok(false);
+            return Ok(None);
         }
 
-        self.write(updated)?;
-        Ok(true)
+        Ok(Some(self.edit(updated)))
     }
 
-    fn remove(&mut self) -> Result<bool, Error> {
+    fn uninstall(self) -> Result<Option<Edit>, Error> {
         let Some(range) = integration_range(&self.text).map_err(|()| Error::MalformedProfile {
             path: self.path.clone(),
         })?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let prefix = &self.text[..range.start];
         let suffix = &self.text[range.end..];
@@ -115,16 +151,34 @@ impl Profile {
         }
         updated.push_str(suffix);
 
-        self.write(updated)?;
-        Ok(true)
+        Ok(Some(self.edit(updated)))
     }
 
-    fn write(&mut self, text: String) -> Result<(), Error> {
-        let bytes = self.encoding.encode(&text);
-        write_atomically(&self.path, self.original.as_deref(), &bytes)?;
-        self.original = Some(bytes);
-        self.text = text;
-        Ok(())
+    fn edit(self, text: String) -> Edit {
+        Edit {
+            path: self.path,
+            original: self.original,
+            updated: self.encoding.encode(&text),
+        }
+    }
+}
+
+struct Edit {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    updated: Vec<u8>,
+}
+
+impl Edit {
+    fn commit(&self) -> Result<(), Error> {
+        write_atomically(&self.path, self.original.as_deref(), &self.updated)
+    }
+
+    fn rollback(&self) -> Result<(), Error> {
+        match &self.original {
+            Some(original) => write_atomically(&self.path, Some(&self.updated), original),
+            None => remove_if_unchanged(&self.path, &self.updated),
+        }
     }
 }
 
@@ -272,6 +326,29 @@ fn write_atomically(path: &Path, original: Option<&[u8]>, bytes: &[u8]) -> Resul
         source,
     })?;
     Ok(())
+}
+
+fn remove_if_unchanged(path: &Path, expected: &[u8]) -> Result<(), Error> {
+    let current = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::ReadProfile {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    if current != expected {
+        return Err(Error::ProfileChanged {
+            path: path.to_owned(),
+        });
+    }
+
+    fs::remove_file(path).map_err(|source| Error::WriteProfile {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 struct TemporaryFile(PathBuf);
@@ -423,12 +500,31 @@ impl std::error::Error for DecodeError {
 
 #[derive(Debug)]
 pub(super) enum Error {
-    InvalidProfilePath { path: PathBuf },
-    ReadProfile { path: PathBuf, source: io::Error },
-    DecodeProfile { path: PathBuf, source: DecodeError },
-    MalformedProfile { path: PathBuf },
-    ProfileChanged { path: PathBuf },
-    WriteProfile { path: PathBuf, source: io::Error },
+    InvalidProfilePath {
+        path: PathBuf,
+    },
+    ReadProfile {
+        path: PathBuf,
+        source: io::Error,
+    },
+    DecodeProfile {
+        path: PathBuf,
+        source: DecodeError,
+    },
+    MalformedProfile {
+        path: PathBuf,
+    },
+    ProfileChanged {
+        path: PathBuf,
+    },
+    WriteProfile {
+        path: PathBuf,
+        source: io::Error,
+    },
+    RollbackFailed {
+        source: Box<Error>,
+        rollback: Vec<Error>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -460,6 +556,16 @@ impl fmt::Display for Error {
             Self::WriteProfile { path, source } => {
                 write!(formatter, "could not update {}: {source}", path.display())
             }
+            Self::RollbackFailed { source, rollback } => {
+                write!(
+                    formatter,
+                    "{source}; Ragavan could not restore all profiles updated before that failure"
+                )?;
+                for failure in rollback {
+                    write!(formatter, ": {failure}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -469,6 +575,7 @@ impl std::error::Error for Error {
         match self {
             Self::ReadProfile { source, .. } | Self::WriteProfile { source, .. } => Some(source),
             Self::DecodeProfile { source, .. } => Some(source),
+            Self::RollbackFailed { source, .. } => Some(source),
             Self::InvalidProfilePath { .. }
             | Self::MalformedProfile { .. }
             | Self::ProfileChanged { .. } => None,

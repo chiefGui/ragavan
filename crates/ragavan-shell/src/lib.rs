@@ -150,8 +150,14 @@ pub enum ShellTarget {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum InstallOutcome {
-    Installed { shell: Shell, profile: PathBuf },
-    AlreadyInstalled { shell: Shell, profile: PathBuf },
+    Installed {
+        shell: Shell,
+        profiles: Vec<PathBuf>,
+    },
+    AlreadyInstalled {
+        shell: Shell,
+        profiles: Vec<PathBuf>,
+    },
 }
 
 impl InstallOutcome {
@@ -161,17 +167,22 @@ impl InstallOutcome {
         }
     }
 
-    pub fn profile(&self) -> &Path {
+    pub fn profiles(&self) -> &[PathBuf] {
         match self {
-            Self::Installed { profile, .. } | Self::AlreadyInstalled { profile, .. } => profile,
+            Self::Installed { profiles, .. } | Self::AlreadyInstalled { profiles, .. } => profiles,
         }
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum UninstallOutcome {
-    Uninstalled { shell: Shell, profile: PathBuf },
-    AlreadyUninstalled { shell: Shell, profile: PathBuf },
+    Uninstalled {
+        shell: Shell,
+        profiles: Vec<PathBuf>,
+    },
+    AlreadyUninstalled {
+        shell: Shell,
+    },
 }
 
 impl UninstallOutcome {
@@ -181,18 +192,34 @@ impl UninstallOutcome {
         }
     }
 
-    pub fn profile(&self) -> &Path {
+    pub fn profiles(&self) -> &[PathBuf] {
         match self {
-            Self::Uninstalled { profile, .. } | Self::AlreadyUninstalled { profile, .. } => profile,
+            Self::Uninstalled { profiles, .. } => profiles,
+            Self::AlreadyUninstalled { .. } => &[],
         }
     }
 }
 
 type AdapterError = Box<dyn std::error::Error>;
 
-struct ProfileEdit {
-    profile: PathBuf,
+struct InstallEdit {
+    profiles: Vec<PathBuf>,
     changed: bool,
+}
+
+enum UninstallEdit {
+    Uninstalled { profiles: Vec<PathBuf> },
+    AlreadyUninstalled,
+}
+
+impl UninstallEdit {
+    fn from_profiles(profiles: Vec<PathBuf>) -> Self {
+        if profiles.is_empty() {
+            Self::AlreadyUninstalled
+        } else {
+            Self::Uninstalled { profiles }
+        }
+    }
 }
 
 struct Adapter {
@@ -200,8 +227,8 @@ struct Adapter {
     display_name: &'static str,
     activation_command: &'static str,
     matches: fn(&Path) -> bool,
-    install: fn(&Selection) -> Result<ProfileEdit, AdapterError>,
-    uninstall: fn(&Selection) -> Result<ProfileEdit, AdapterError>,
+    install: fn(&Selection) -> Result<InstallEdit, AdapterError>,
+    uninstall: fn(&Selection) -> Result<UninstallEdit, AdapterError>,
     hook: fn(&[&str]) -> String,
 }
 
@@ -225,12 +252,12 @@ pub fn install(target: ShellTarget) -> Result<InstallOutcome, Error> {
     if edit.changed {
         Ok(InstallOutcome::Installed {
             shell: Shell(resolved.adapter),
-            profile: edit.profile,
+            profiles: edit.profiles,
         })
     } else {
         Ok(InstallOutcome::AlreadyInstalled {
             shell: Shell(resolved.adapter),
-            profile: edit.profile,
+            profiles: edit.profiles,
         })
     }
 }
@@ -239,16 +266,14 @@ pub fn uninstall(target: ShellTarget) -> Result<UninstallOutcome, Error> {
     let resolved = resolve(target)?;
     let edit = (resolved.adapter.uninstall)(&resolved.selection).map_err(Error::adapter)?;
 
-    if edit.changed {
-        Ok(UninstallOutcome::Uninstalled {
+    match edit {
+        UninstallEdit::Uninstalled { profiles } => Ok(UninstallOutcome::Uninstalled {
             shell: Shell(resolved.adapter),
-            profile: edit.profile,
-        })
-    } else {
-        Ok(UninstallOutcome::AlreadyUninstalled {
+            profiles,
+        }),
+        UninstallEdit::AlreadyUninstalled => Ok(UninstallOutcome::AlreadyUninstalled {
             shell: Shell(resolved.adapter),
-            profile: edit.profile,
-        })
+        }),
     }
 }
 

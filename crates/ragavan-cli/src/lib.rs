@@ -13,7 +13,7 @@ use std::{
     process::{Command as ProcessCommand, ExitStatus},
 };
 
-const JSON_SCHEMA_VERSION: u8 = 1;
+const JSON_SCHEMA_VERSION: u8 = 2;
 
 /// Run Ragavan's command-line interface and return its process status code.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
@@ -181,7 +181,11 @@ impl Outcome {
                             ragavan_shell::InstallOutcome::Installed { .. } => "installed",
                             ragavan_shell::InstallOutcome::AlreadyInstalled { .. } => "already_installed",
                         },
-                        "profile": outcome.profile().to_string_lossy(),
+                        "profiles": outcome
+                            .profiles()
+                            .iter()
+                            .map(|profile| profile.to_string_lossy())
+                            .collect::<Vec<_>>(),
                     },
                 })
             }
@@ -195,7 +199,11 @@ impl Outcome {
                             ragavan_shell::UninstallOutcome::Uninstalled { .. } => "uninstalled",
                             ragavan_shell::UninstallOutcome::AlreadyUninstalled { .. } => "already_uninstalled",
                         },
-                        "profile": outcome.profile().to_string_lossy(),
+                        "profiles": outcome
+                            .profiles()
+                            .iter()
+                            .map(|profile| profile.to_string_lossy())
+                            .collect::<Vec<_>>(),
                     },
                 })
             }
@@ -270,9 +278,9 @@ fn print_installation(outcome: ragavan_shell::InstallOutcome) {
             println!("Ragavan is already installed for {}.", shell.display_name());
         }
     }
-    println!("Profile: {}", outcome.profile().display());
+    print_profiles(outcome.profiles());
     println!(
-        "Future {} sessions that read this profile will load Ragavan automatically.",
+        "Future {} sessions will load Ragavan automatically.",
         shell.display_name()
     );
     println!(
@@ -287,6 +295,14 @@ fn print_uninstallation(outcome: ragavan_shell::UninstallOutcome) {
     match &outcome {
         ragavan_shell::UninstallOutcome::Uninstalled { .. } => {
             println!("Ragavan is uninstalled from {}.", shell.display_name());
+            print_profiles(outcome.profiles());
+            println!(
+                "Future {} sessions will no longer load Ragavan automatically.",
+                shell.display_name()
+            );
+            println!(
+                "Loaded integration remains active in existing sessions until they are closed."
+            );
         }
         ragavan_shell::UninstallOutcome::AlreadyUninstalled { .. } => {
             println!(
@@ -295,12 +311,19 @@ fn print_uninstallation(outcome: ragavan_shell::UninstallOutcome) {
             );
         }
     }
-    println!("Profile: {}", outcome.profile().display());
-    println!(
-        "Future {} sessions will no longer load Ragavan from this profile.",
-        shell.display_name()
-    );
-    println!("Loaded integration remains active in existing sessions until they are closed.");
+}
+
+fn print_profiles(profiles: &[std::path::PathBuf]) {
+    match profiles {
+        [] => {}
+        [profile] => println!("Profile: {}", profile.display()),
+        profiles => {
+            println!("Profiles:");
+            for profile in profiles {
+                println!("  {}", profile.display());
+            }
+        }
+    }
 }
 
 fn enrollment_message(enrollment: Enrollment) -> &'static str {

@@ -1,14 +1,21 @@
-use crate::{Adapter, AdapterError, ProfileEdit, Selection, profile, protocol::RUN_COMMAND};
+use crate::{
+    Adapter, AdapterError, InstallEdit, Selection, UninstallEdit, profile, protocol::RUN_COMMAND,
+};
 use std::{
     fmt,
     fmt::Write as _,
+    fs, io,
     path::{Path, PathBuf},
 };
 
+const LOGIN_PROFILE_NAMES: [&str; 3] = [".bash_profile", ".bash_login", ".profile"];
+
 const PROFILE_INTEGRATION: &[&str] = &[
     "# Managed by Ragavan. Run `ragavan uninstall bash` to remove.",
-    "if builtin type -P ragavan >/dev/null 2>&1; then",
-    "    eval \"$(command ragavan hook bash)\"",
+    "if [ -n \"${BASH_VERSION:-}\" ]; then",
+    "    if builtin type -P ragavan >/dev/null 2>&1; then",
+    "        eval \"$(command ragavan hook bash)\"",
+    "    fi",
     "fi",
 ];
 
@@ -37,11 +44,11 @@ fn matches(executable: &Path) -> bool {
         })
 }
 
-fn install(_: &Selection) -> Result<ProfileEdit, AdapterError> {
+fn install(_: &Selection) -> Result<InstallEdit, AdapterError> {
     Ok(Bash::current()?.install()?)
 }
 
-fn uninstall(_: &Selection) -> Result<ProfileEdit, AdapterError> {
+fn uninstall(_: &Selection) -> Result<UninstallEdit, AdapterError> {
     Ok(Bash::current()?.uninstall()?)
 }
 
@@ -78,7 +85,7 @@ fn hook(commands: &[&str]) -> String {
 }
 
 struct Bash {
-    profile: PathBuf,
+    home: PathBuf,
 }
 
 impl Bash {
@@ -96,24 +103,59 @@ impl Bash {
             return Err(Error::InvalidHome(home.to_owned()));
         }
         Ok(Self {
-            profile: home.join(".bashrc"),
+            home: home.to_owned(),
         })
     }
 
-    fn install(self) -> Result<ProfileEdit, profile::Error> {
-        let changed = profile::install(&self.profile, PROFILE_INTEGRATION)?;
-        Ok(ProfileEdit {
-            profile: self.profile,
-            changed,
-        })
+    fn install(self) -> Result<InstallEdit, Error> {
+        let profiles = self.installation_profiles()?;
+        let changed = !profile::install(&profiles, PROFILE_INTEGRATION)?.is_empty();
+        Ok(InstallEdit { profiles, changed })
     }
 
-    fn uninstall(self) -> Result<ProfileEdit, profile::Error> {
-        let changed = profile::uninstall(&self.profile)?;
-        Ok(ProfileEdit {
-            profile: self.profile,
-            changed,
-        })
+    fn uninstall(self) -> Result<UninstallEdit, Error> {
+        Ok(UninstallEdit::from_profiles(profile::uninstall(
+            &self.profile_candidates(),
+        )?))
+    }
+
+    fn installation_profiles(&self) -> Result<Vec<PathBuf>, Error> {
+        Ok(vec![self.home.join(".bashrc"), self.login_profile()?])
+    }
+
+    fn login_profile(&self) -> Result<PathBuf, Error> {
+        for name in LOGIN_PROFILE_NAMES {
+            let profile = self.home.join(name);
+            match fs::File::open(&profile) {
+                Ok(file) => {
+                    let metadata = file.metadata().map_err(|source| Error::InspectProfile {
+                        profile: profile.clone(),
+                        source,
+                    })?;
+                    if metadata.is_file() {
+                        return Ok(profile);
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::IsADirectory
+                    ) => {}
+                Err(source) => return Err(Error::InspectProfile { profile, source }),
+            }
+        }
+
+        Ok(self
+            .home
+            .join(LOGIN_PROFILE_NAMES[LOGIN_PROFILE_NAMES.len() - 1]))
+    }
+
+    fn profile_candidates(&self) -> Vec<PathBuf> {
+        std::iter::once(self.home.join(".bashrc"))
+            .chain(LOGIN_PROFILE_NAMES.map(|name| self.home.join(name)))
+            .collect()
     }
 }
 
@@ -121,6 +163,14 @@ impl Bash {
 enum Error {
     MissingHome,
     InvalidHome(PathBuf),
+    InspectProfile { profile: PathBuf, source: io::Error },
+    UpdateProfile(profile::Error),
+}
+
+impl From<profile::Error> for Error {
+    fn from(error: profile::Error) -> Self {
+        Self::UpdateProfile(error)
+    }
 }
 
 impl fmt::Display for Error {
@@ -136,11 +186,27 @@ impl fmt::Display for Error {
                 "could not locate the Bash profile because the home directory is not an absolute path: {}",
                 home.display()
             ),
+            Self::InspectProfile { profile, source } => {
+                write!(
+                    formatter,
+                    "could not inspect {}: {source}",
+                    profile.display()
+                )
+            }
+            Self::UpdateProfile(source) => source.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InspectProfile { source, .. } => Some(source),
+            Self::UpdateProfile(source) => Some(source),
+            Self::MissingHome | Self::InvalidHome(_) => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -187,42 +253,185 @@ mod tests {
     }
 
     #[test]
-    fn home_maps_to_the_non_login_interactive_profile() {
-        let home = if cfg!(windows) {
-            Path::new("C:/Users/ragavan-test")
-        } else {
-            Path::new("/home/ragavan-test")
-        };
-        let bash = Bash::from_home(home).expect("absolute HOME should be accepted");
+    fn missing_login_profile_selects_the_lowest_precedence_profile() {
+        let directory = TestDirectory::new();
+        let bash = Bash::from_home(directory.path()).expect("absolute HOME should be accepted");
 
-        assert_eq!(bash.profile, home.join(".bashrc"));
+        assert_eq!(
+            bash.installation_profiles()
+                .expect("profiles should be selected"),
+            [
+                directory.path().join(".bashrc"),
+                directory.path().join(".profile"),
+            ]
+        );
     }
 
     #[test]
-    fn installation_renders_the_bash_bootstrap() {
+    fn installation_covers_interactive_and_login_bash_without_shadowing_profile() {
         let directory = TestDirectory::new();
-        let profile = directory.path().join(".bashrc");
-        let original = b"alias serve=project\n";
-        fs::write(&profile, original).expect("profile should be written");
+        let bashrc = directory.path().join(".bashrc");
+        let login = directory.path().join(".profile");
+        let bashrc_original = b"alias serve=project\n";
+        let login_original = b"export PROJECT_MODE=development\n";
+        fs::write(&bashrc, bashrc_original).expect("Bash profile should be written");
+        fs::write(&login, login_original).expect("login profile should be written");
 
-        let edit = bash(&profile).install().expect("install should succeed");
+        let edit = bash(directory.path())
+            .install()
+            .expect("install should succeed");
         assert!(edit.changed);
-        assert_eq!(edit.profile, profile);
-        let installed = fs::read_to_string(&profile).expect("profile should remain UTF-8");
-        assert!(installed.starts_with("alias serve=project\n"));
-        assert!(installed.contains("builtin type -P ragavan"));
-        assert!(installed.contains("ragavan hook bash"));
-        assert!(!installed.contains("hook powershell"));
+        assert_eq!(edit.profiles, [bashrc.clone(), login.clone()]);
+        assert!(!directory.path().join(".bash_profile").exists());
 
-        assert!(
-            bash(&profile)
-                .uninstall()
-                .expect("uninstall should succeed")
-                .changed
+        let installed_bashrc = fs::read_to_string(&bashrc).expect("Bash profile should be UTF-8");
+        let installed_login = fs::read_to_string(&login).expect("login profile should be UTF-8");
+        assert!(installed_bashrc.starts_with("alias serve=project\n"));
+        assert!(installed_login.starts_with("export PROJECT_MODE=development\n"));
+        for installed in [&installed_bashrc, &installed_login] {
+            assert!(installed.contains("[ -n \"${BASH_VERSION:-}\" ]"));
+            assert!(installed.contains("builtin type -P ragavan"));
+            assert!(installed.contains("ragavan hook bash"));
+            assert!(!installed.contains("hook powershell"));
+        }
+
+        let edit = bash(directory.path())
+            .uninstall()
+            .expect("uninstall should succeed");
+        let UninstallEdit::Uninstalled { profiles } = edit else {
+            panic!("installed integration should be removed");
+        };
+        assert_eq!(profiles, [bashrc.clone(), login.clone()]);
+        assert_eq!(
+            fs::read(&bashrc).expect("profile should be readable"),
+            bashrc_original
         );
         assert_eq!(
-            fs::read(&profile).expect("profile should be readable"),
-            original
+            fs::read(&login).expect("profile should be readable"),
+            login_original
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_in_profile_is_safe_for_non_bash_shells() {
+        let directory = TestDirectory::new();
+        fs::write(
+            directory.path().join(".profile"),
+            "TEST_USER_CONTENT=preserved\n",
+        )
+        .expect("profile should be written");
+        bash(directory.path())
+            .install()
+            .expect("install should succeed");
+
+        let output = std::process::Command::new("sh")
+            .args(["-c", ". \"$HOME/.profile\""])
+            .env("HOME", directory.path())
+            .env_remove("BASH_VERSION")
+            .output()
+            .expect("a POSIX shell should start");
+
+        assert!(
+            output.status.success(),
+            "a non-Bash shell should read .profile without integration errors: {output:?}"
+        );
+    }
+
+    #[test]
+    fn login_profile_follows_bash_precedence() {
+        let cases: &[(&[&str], &str)] = &[
+            (&[".profile"], ".profile"),
+            (&[".profile", ".bash_login"], ".bash_login"),
+            (
+                &[".profile", ".bash_login", ".bash_profile"],
+                ".bash_profile",
+            ),
+        ];
+
+        for &(present, expected) in cases {
+            let directory = TestDirectory::new();
+            for name in present {
+                fs::write(
+                    directory.path().join(name),
+                    format!("user content for {name}\n"),
+                )
+                .expect("login profile should be written");
+            }
+
+            let profiles = bash(directory.path())
+                .installation_profiles()
+                .expect("profiles should be selected");
+            assert_eq!(profiles[1], directory.path().join(expected));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_profile_skips_a_dangling_higher_precedence_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        symlink(
+            directory.path().join("missing-target"),
+            directory.path().join(".bash_profile"),
+        )
+        .expect("dangling profile link should be created");
+        fs::write(directory.path().join(".profile"), "readable profile\n")
+            .expect("readable profile should be written");
+
+        let profiles = bash(directory.path())
+            .installation_profiles()
+            .expect("profiles should be selected");
+
+        assert_eq!(profiles[1], directory.path().join(".profile"));
+    }
+
+    #[test]
+    fn uninstall_removes_integration_left_by_login_profile_precedence_changes() {
+        const PROFILE_ORIGINAL: &str = "original profile\n";
+        const BASH_PROFILE_ORIGINAL: &str = "new higher-priority profile\n";
+
+        let directory = TestDirectory::new();
+        let profile = directory.path().join(".profile");
+        fs::write(&profile, PROFILE_ORIGINAL).expect("profile should be written");
+        bash(directory.path())
+            .install()
+            .expect("initial install should succeed");
+
+        let bash_profile = directory.path().join(".bash_profile");
+        fs::write(&bash_profile, BASH_PROFILE_ORIGINAL)
+            .expect("higher-priority profile should be written");
+        bash(directory.path())
+            .install()
+            .expect("reinstall should follow current precedence");
+
+        let edit = bash(directory.path())
+            .uninstall()
+            .expect("uninstall should succeed");
+        let UninstallEdit::Uninstalled { profiles: removed } = edit else {
+            panic!("installed integration should be removed");
+        };
+        assert_eq!(
+            removed,
+            [
+                directory.path().join(".bashrc"),
+                bash_profile.clone(),
+                profile.clone(),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join(".bashrc"))
+                .expect("Bash profile should be readable"),
+            ""
+        );
+        assert_eq!(
+            fs::read_to_string(bash_profile).expect("Bash profile should be readable"),
+            BASH_PROFILE_ORIGINAL
+        );
+        assert_eq!(
+            fs::read_to_string(profile).expect("profile should be readable"),
+            PROFILE_ORIGINAL
         );
     }
 
@@ -263,9 +472,9 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains(TEST));
     }
 
-    fn bash(profile: &Path) -> Bash {
+    fn bash(home: &Path) -> Bash {
         Bash {
-            profile: profile.to_owned(),
+            home: home.to_owned(),
         }
     }
 

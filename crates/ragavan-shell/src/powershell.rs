@@ -1,4 +1,6 @@
-use crate::{Adapter, AdapterError, ProfileEdit, Selection, profile, protocol::RUN_COMMAND};
+use crate::{
+    Adapter, AdapterError, InstallEdit, Selection, UninstallEdit, profile, protocol::RUN_COMMAND,
+};
 use std::{
     ffi::OsStr,
     fmt, io,
@@ -57,11 +59,11 @@ fn hook(commands: &[&str]) -> String {
     hook
 }
 
-fn install(selection: &Selection) -> Result<ProfileEdit, AdapterError> {
+fn install(selection: &Selection) -> Result<InstallEdit, AdapterError> {
     Ok(PowerShell::resolve(selection)?.install()?)
 }
 
-fn uninstall(selection: &Selection) -> Result<ProfileEdit, AdapterError> {
+fn uninstall(selection: &Selection) -> Result<UninstallEdit, AdapterError> {
     Ok(PowerShell::resolve(selection)?.uninstall()?)
 }
 
@@ -121,20 +123,16 @@ impl PowerShell {
         Ok(Self { profile })
     }
 
-    fn install(self) -> Result<ProfileEdit, profile::Error> {
-        let changed = profile::install(&self.profile, PROFILE_INTEGRATION)?;
-        Ok(ProfileEdit {
-            profile: self.profile,
-            changed,
-        })
+    fn install(self) -> Result<InstallEdit, profile::Error> {
+        let profiles = vec![self.profile];
+        let changed = !profile::install(&profiles, PROFILE_INTEGRATION)?.is_empty();
+        Ok(InstallEdit { profiles, changed })
     }
 
-    fn uninstall(self) -> Result<ProfileEdit, profile::Error> {
-        let changed = profile::uninstall(&self.profile)?;
-        Ok(ProfileEdit {
-            profile: self.profile,
-            changed,
-        })
+    fn uninstall(self) -> Result<UninstallEdit, profile::Error> {
+        Ok(UninstallEdit::from_profiles(profile::uninstall(&[
+            self.profile
+        ])?))
     }
 }
 
@@ -294,7 +292,7 @@ mod tests {
             .install()
             .expect("install should succeed");
         assert!(edit.changed);
-        assert_eq!(edit.profile, profile);
+        assert_eq!(edit.profiles, std::slice::from_ref(&profile));
         let installed = fs::read_to_string(&profile).expect("profile should remain UTF-8");
         assert!(installed.starts_with("Set-Alias serve Invoke-Project"));
         assert!(installed.contains("Get-Command ragavan -CommandType Application"));
@@ -302,12 +300,13 @@ mod tests {
         assert!(installed.contains("Remove-Variable __RagavanBootstrapCommand"));
         assert!(!installed.contains("hook bash"));
 
-        assert!(
-            powershell(&profile)
-                .uninstall()
-                .expect("uninstall should succeed")
-                .changed
-        );
+        let edit = powershell(&profile)
+            .uninstall()
+            .expect("uninstall should succeed");
+        let UninstallEdit::Uninstalled { profiles } = edit else {
+            panic!("installed integration should be removed");
+        };
+        assert_eq!(profiles, std::slice::from_ref(&profile));
         assert_eq!(
             fs::read(&profile).expect("profile should be readable"),
             original

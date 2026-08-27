@@ -14,7 +14,7 @@ fn installation_is_idempotent_and_uninstallation_restores_user_content() {
     let original = b"user-owned content";
     fs::write(&profile, original).expect("profile should be written");
 
-    assert!(install(&profile, INTEGRATION).expect("install should succeed"));
+    assert!(install_one(&profile).expect("install should succeed"));
     let installed = fs::read_to_string(&profile).expect("profile should remain UTF-8");
     assert!(installed.starts_with("user-owned content"));
     assert_eq!(installed.matches(START_MARKER).count(), 1);
@@ -22,18 +22,18 @@ fn installation_is_idempotent_and_uninstallation_restores_user_content() {
     assert!(installed.contains(INTEGRATION[0]));
 
     let installed_bytes = fs::read(&profile).expect("profile should be readable");
-    assert!(!install(&profile, INTEGRATION).expect("reinstall should succeed"));
+    assert!(!install_one(&profile).expect("reinstall should succeed"));
     assert_eq!(
         fs::read(&profile).expect("profile should be readable"),
         installed_bytes
     );
 
-    assert!(uninstall(&profile).expect("uninstall should succeed"));
+    assert!(uninstall_one(&profile).expect("uninstall should succeed"));
     assert_eq!(
         fs::read(&profile).expect("profile should be readable"),
         original
     );
-    assert!(!uninstall(&profile).expect("repeated uninstall should succeed"));
+    assert!(!uninstall_one(&profile).expect("repeated uninstall should succeed"));
 }
 
 #[test]
@@ -50,14 +50,14 @@ fn installation_updates_only_the_owned_block_and_preserves_newlines() {
     );
     fs::write(&profile, original).expect("profile should be written");
 
-    assert!(install(&profile, INTEGRATION).expect("install should succeed"));
+    assert!(install_one(&profile).expect("install should succeed"));
     let installed = fs::read_to_string(&profile).expect("profile should be readable");
     assert!(installed.starts_with("before\r\n\r\n"));
     assert!(installed.ends_with("after\r\n"));
     assert!(!installed.contains("stale integration"));
     assert!(!installed.replace("\r\n", "").contains('\n'));
 
-    uninstall(&profile).expect("uninstall should succeed");
+    uninstall_one(&profile).expect("uninstall should succeed");
     assert_eq!(
         fs::read_to_string(&profile).expect("profile should be readable"),
         "before\r\nafter\r\n"
@@ -71,7 +71,7 @@ fn malformed_markers_are_rejected_without_modifying_the_profile() {
     let original = b"before\n# >>> ragavan >>>\nmissing end marker\n";
     fs::write(&profile, original).expect("profile should be written");
 
-    let error = install(&profile, INTEGRATION).expect_err("malformed integration should fail");
+    let error = install_one(&profile).expect_err("malformed integration should fail");
     assert!(error.to_string().contains("markers are incomplete"));
     assert_eq!(
         fs::read(&profile).expect("profile should be readable"),
@@ -92,12 +92,12 @@ fn utf16_encoding_is_preserved() {
     let original = utf16_little_endian("message = 'olá'\r\n");
     fs::write(&profile, &original).expect("profile should be written");
 
-    install(&profile, INTEGRATION).expect("install should succeed");
+    install_one(&profile).expect("install should succeed");
     let installed = fs::read(&profile).expect("profile should be readable");
     assert!(installed.starts_with(&[0xff, 0xfe]));
     assert!(decode_utf16_little_endian(&installed).contains(INTEGRATION[0]));
 
-    uninstall(&profile).expect("uninstall should succeed");
+    uninstall_one(&profile).expect("uninstall should succeed");
     assert_eq!(
         fs::read(&profile).expect("profile should be readable"),
         original
@@ -111,10 +111,30 @@ fn unsupported_encoding_is_rejected_without_modifying_the_profile() {
     let original = [0x80, 0x81];
     fs::write(&profile, original).expect("profile should be written");
 
-    let error = install(&profile, INTEGRATION).expect_err("unsupported encoding should fail");
+    let error = install_one(&profile).expect_err("unsupported encoding should fail");
     assert!(error.to_string().contains("text encoding is unsupported"));
     assert_eq!(
         fs::read(&profile).expect("profile should be readable"),
+        original
+    );
+}
+
+#[test]
+fn every_profile_is_validated_before_any_profile_is_modified() {
+    let directory = TestDirectory::new();
+    let first = directory.path().join("first");
+    let malformed = directory.path().join("malformed");
+    let original = b"user-owned first profile\n";
+    fs::write(&first, original).expect("first profile should be written");
+    fs::write(&malformed, "# >>> ragavan >>>\nincomplete integration\n")
+        .expect("malformed profile should be written");
+
+    let error = install(&[first.clone(), malformed], INTEGRATION)
+        .expect_err("the transaction should reject a malformed profile");
+
+    assert!(error.to_string().contains("markers are incomplete"));
+    assert_eq!(
+        fs::read(first).expect("first profile should be readable"),
         original
     );
 }
@@ -124,7 +144,7 @@ fn installation_creates_a_missing_profile_and_parent_directory() {
     let directory = TestDirectory::new();
     let profile = directory.path().join("missing").join("profile");
 
-    assert!(install(&profile, INTEGRATION).expect("install should succeed"));
+    assert!(install_one(&profile).expect("install should succeed"));
     let installed = fs::read_to_string(&profile).expect("profile should be readable");
     assert!(installed.starts_with(START_MARKER));
     assert!(installed.ends_with(if cfg!(windows) { "\r\n" } else { "\n" }));
@@ -142,7 +162,7 @@ fn installation_preserves_a_linked_profile() {
     fs::write(&target, original).expect("profile target should be written");
     symlink(&target, &profile).expect("profile link should be created");
 
-    install(&profile, INTEGRATION).expect("install should succeed");
+    install_one(&profile).expect("install should succeed");
     assert!(
         fs::symlink_metadata(&profile)
             .expect("profile link should exist")
@@ -155,11 +175,19 @@ fn installation_preserves_a_linked_profile() {
             .contains(INTEGRATION[0])
     );
 
-    uninstall(&profile).expect("uninstall should succeed");
+    uninstall_one(&profile).expect("uninstall should succeed");
     assert_eq!(
         fs::read(&target).expect("profile target should be readable"),
         original
     );
+}
+
+fn install_one(path: &Path) -> Result<bool, Error> {
+    Ok(!install(&[path.to_owned()], INTEGRATION)?.is_empty())
+}
+
+fn uninstall_one(path: &Path) -> Result<bool, Error> {
+    Ok(!uninstall(&[path.to_owned()])?.is_empty())
 }
 
 fn utf16_little_endian(text: &str) -> Vec<u8> {
