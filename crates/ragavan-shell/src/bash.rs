@@ -19,11 +19,6 @@ const PROFILE_INTEGRATION: &[&str] = &[
     "fi",
 ];
 
-const HOOK_HEADER: &str = concat!(
-    "__RagavanCommand=\"$(builtin type -P ragavan)\"\n",
-    "declare -a __RagavanOriginalCommands=()\n",
-);
-
 pub(super) const ADAPTER: Adapter = Adapter {
     name: "bash",
     display_name: "Bash",
@@ -52,8 +47,11 @@ fn uninstall(_: &Selection) -> Result<UninstallEdit, AdapterError> {
     Ok(Bash::current()?.uninstall()?)
 }
 
-fn hook(commands: &[&str]) -> String {
-    let mut hook = HOOK_HEADER.to_owned();
+fn hook(native_executable: &str, commands: &[&str]) -> String {
+    let mut hook = format!(
+        "__RagavanExecutable={}\ndeclare -a __RagavanOriginalCommands=()\n",
+        shell_literal(native_executable)
+    );
     for (index, command) in commands.iter().enumerate() {
         assert!(
             command
@@ -70,18 +68,22 @@ fn hook(commands: &[&str]) -> String {
         #[cfg(windows)]
         writeln!(
             hook,
-            "        \"${{__RagavanCommand}}\" {RUN_COMMAND} '{command}' \"${{BASH}}\" '3' '-c' 'exec \"$0\" \"$@\"' \"${{__RagavanOriginalCommands[{index}]}}\" \"$@\""
+            "        \"${{__RagavanExecutable}}\" {RUN_COMMAND} '{command}' \"${{BASH}}\" '3' '-c' 'exec \"$0\" \"$@\"' \"${{__RagavanOriginalCommands[{index}]}}\" \"$@\""
         )
         .expect("writing to a string cannot fail");
         #[cfg(not(windows))]
         writeln!(
             hook,
-            "        \"${{__RagavanCommand}}\" {RUN_COMMAND} '{command}' \"${{__RagavanOriginalCommands[{index}]}}\" '0' \"$@\""
+            "        \"${{__RagavanExecutable}}\" {RUN_COMMAND} '{command}' \"${{__RagavanOriginalCommands[{index}]}}\" '0' \"$@\""
         )
         .expect("writing to a string cannot fail");
         hook.push_str("    }\nfi\n");
     }
     hook
+}
+
+fn shell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 struct Bash {
@@ -220,26 +222,25 @@ mod tests {
 
     #[test]
     fn hook_routes_every_registered_command_through_one_protocol() {
-        let hook = hook(&["alpha", "beta"]);
+        let hook = hook("/native/ragavan", &["alpha", "beta"]);
 
-        assert!(hook.starts_with("__RagavanCommand=\"$(builtin type -P ragavan)\"\n"));
         assert!(hook.contains("function alpha"));
         #[cfg(windows)]
         assert!(hook.contains(
-            "\"${__RagavanCommand}\" __run 'alpha' \"${BASH}\" '3' '-c' 'exec \"$0\" \"$@\"' \"${__RagavanOriginalCommands[0]}\" \"$@\""
+            "\"${__RagavanExecutable}\" __run 'alpha' \"${BASH}\" '3' '-c' 'exec \"$0\" \"$@\"' \"${__RagavanOriginalCommands[0]}\" \"$@\""
         ));
         #[cfg(not(windows))]
         assert!(hook.contains(
-            "\"${__RagavanCommand}\" __run 'alpha' \"${__RagavanOriginalCommands[0]}\" '0' \"$@\""
+            "\"${__RagavanExecutable}\" __run 'alpha' \"${__RagavanOriginalCommands[0]}\" '0' \"$@\""
         ));
         assert!(hook.contains("function beta"));
         #[cfg(windows)]
         assert!(hook.contains(
-            "\"${__RagavanCommand}\" __run 'beta' \"${BASH}\" '3' '-c' 'exec \"$0\" \"$@\"' \"${__RagavanOriginalCommands[1]}\" \"$@\""
+            "\"${__RagavanExecutable}\" __run 'beta' \"${BASH}\" '3' '-c' 'exec \"$0\" \"$@\"' \"${__RagavanOriginalCommands[1]}\" \"$@\""
         ));
         #[cfg(not(windows))]
         assert!(hook.contains(
-            "\"${__RagavanCommand}\" __run 'beta' \"${__RagavanOriginalCommands[1]}\" '0' \"$@\""
+            "\"${__RagavanExecutable}\" __run 'beta' \"${__RagavanOriginalCommands[1]}\" '0' \"$@\""
         ));
     }
 

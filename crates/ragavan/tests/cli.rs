@@ -185,12 +185,12 @@ fn installed_bash_integration_loads_in_login_and_non_login_sessions() {
     .expect("test PATH should be valid");
 
     for arguments in [
-        vec!["--login", "-c", "test -n \"${__RagavanCommand:-}\""],
+        vec!["--login", "-c", "test -n \"${__RagavanExecutable:-}\""],
         vec![
             "--noprofile",
             "-i",
             "-c",
-            "test -n \"${__RagavanCommand:-}\"",
+            "test -n \"${__RagavanExecutable:-}\"",
         ],
     ] {
         let output = Command::new("bash")

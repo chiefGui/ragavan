@@ -28,21 +28,20 @@ pub(super) const ADAPTER: Adapter = Adapter {
     hook,
 };
 
-const POWERSHELL_HOOK_HEADER: &str = r#"$global:__RagavanOriginalCommands = @{}
-$global:__RagavanCommand = Get-Command ragavan -CommandType Application -ErrorAction Stop | Select-Object -First 1
-"#;
-
 const POWERSHELL_COMMAND_HOOK: &str = r#"
 $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'] = Get-Command '__RAGAVAN_COMMAND__' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -ne $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__']) {
     function global:__RAGAVAN_COMMAND__ {
-        & $global:__RagavanCommand __RAGAVAN_RUN_COMMAND__ '__RAGAVAN_COMMAND__' $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'].Path '0' @args
+        & $global:__RagavanExecutable __RAGAVAN_RUN_COMMAND__ '__RAGAVAN_COMMAND__' $global:__RagavanOriginalCommands['__RAGAVAN_COMMAND__'].Path '0' @args
     }
 }
 "#;
 
-fn hook(commands: &[&str]) -> String {
-    let mut hook = POWERSHELL_HOOK_HEADER.to_owned();
+fn hook(native_executable: &str, commands: &[&str]) -> String {
+    let mut hook = format!(
+        "$global:__RagavanOriginalCommands = @{{}}\n$global:__RagavanExecutable = {}\n",
+        shell_literal(native_executable)
+    );
     for command in commands {
         assert!(
             command
@@ -57,6 +56,10 @@ fn hook(commands: &[&str]) -> String {
         );
     }
     hook
+}
+
+fn shell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn install(selection: &Selection) -> Result<InstallEdit, AdapterError> {
@@ -271,7 +274,7 @@ mod tests {
 
     #[test]
     fn hook_renders_every_registered_command_through_one_protocol() {
-        let hook = hook(&["alpha", "beta"]);
+        let hook = hook("C:\\native\\ragavan.exe", &["alpha", "beta"]);
 
         assert!(hook.contains("function global:alpha"));
         assert!(hook.contains("__run 'alpha'"));

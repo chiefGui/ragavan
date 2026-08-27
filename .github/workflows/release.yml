@@ -21,6 +21,7 @@ jobs:
     name: Prepare release
     runs-on: ubuntu-24.04
     outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -29,6 +30,20 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup show
+
+      - name: Install pinned Node.js runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+
+      - name: Resolve release platforms
+        id: platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          matrix="$(node packaging/platforms.mjs)"
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
       - name: Resolve release identity
         id: release
@@ -61,20 +76,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
-            binary: ragavan.exe
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            binary: ragavan
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            binary: ragavan
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            binary: ragavan
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -167,6 +169,11 @@ jobs:
           path: target/release-inputs
           merge-multiple: false
 
+      - name: Install pinned Node.js runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+
       - name: Package release artifacts
         shell: bash
         run: |
@@ -174,6 +181,14 @@ jobs:
             '${{ needs.prepare.outputs.version }}' \
             target/release-inputs \
             target/distribution
+
+      - name: Package npm artifacts
+        shell: bash
+        run: |
+          node packaging/npm/package.mjs \
+            '${{ needs.prepare.outputs.version }}' \
+            target/release-inputs \
+            target/npm-distribution
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -184,12 +199,49 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+      - name: Upload npm artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-${{ needs.prepare.outputs.version }}
+          path: target/npm-distribution/*.tgz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  npm-smoke:
+    name: Test npm package (${{ matrix.target }})
+    needs:
+      - prepare
+      - package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Node.js runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+
+      - name: Download npm artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-${{ needs.prepare.outputs.version }}
+          path: target/npm-distribution
+
+      - name: Install and run npm package
+        run: node packaging/npm/smoke.mjs "${{ needs.prepare.outputs.version }}" "${{ matrix.target }}" "target/npm-distribution" "${{ runner.temp }}/ragavan-npm-smoke"
+
   publish:
     name: Publish release
     if: github.event_name == 'push'
     needs:
       - prepare
       - package
+      - npm-smoke
     runs-on: ubuntu-24.04
     permissions:
       artifact-metadata: write
@@ -202,6 +254,22 @@ jobs:
         with:
           name: release-${{ needs.prepare.outputs.version }}
           path: target/distribution
+
+      - name: Download npm artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-${{ needs.prepare.outputs.version }}
+          path: target/distribution
+
+      - name: Finalize release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd target/distribution
+          sha256sum --check SHA256SUMS
+          sha256sum ragavan-* > SHA256SUMS
+          sha256sum --check SHA256SUMS
 
       - name: Generate release provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2

@@ -1,0 +1,42 @@
+[
+  {
+    "target": "x86_64-pc-windows-msvc",
+    "runner": "windows-2025",
+    "binary": "ragavan.exe",
+    "npm": {
+      "os": "win32",
+      "cpu": "x64",
+      "package": "ragavan-win32-x64-msvc"
+    }
+  },
+  {
+    "target": "x86_64-unknown-linux-musl",
+    "runner": "ubuntu-24.04",
+    "binary": "ragavan",
+    "npm": {
+      "os": "linux",
+      "cpu": "x64",
+      "package": "ragavan-linux-x64-musl"
+    }
+  },
+  {
+    "target": "x86_64-apple-darwin",
+    "runner": "macos-15-intel",
+    "binary": "ragavan",
+    "npm": {
+      "os": "darwin",
+      "cpu": "x64",
+      "package": "ragavan-darwin-x64"
+    }
+  },
+  {
+    "target": "aarch64-apple-darwin",
+    "runner": "macos-15",
+    "binary": "ragavan",
+    "npm": {
+      "os": "darwin",
+      "cpu": "arm64",
+      "package": "ragavan-darwin-arm64"
+    }
+  }
+]

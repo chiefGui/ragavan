@@ -8,6 +8,7 @@ use clap::{
 use ragavan_core::{Enrollment, LaunchPlan, ServiceIdentity};
 use serde_json::{Value, json};
 use std::{
+    env,
     ffi::OsString,
     fmt, io,
     process::{Command as ProcessCommand, ExitStatus},
@@ -69,10 +70,21 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
                     format,
                 );
             }
-            print!(
-                "{}",
-                ragavan_shell::hook(shell, ragavan_adapters::commands())
-            );
+            let native_executable = match env::current_exe() {
+                Ok(executable) => executable,
+                Err(source) => {
+                    return report_failure(Failure::CurrentExecutable(source), format);
+                }
+            };
+            let hook = match ragavan_shell::hook(
+                shell,
+                &native_executable,
+                ragavan_adapters::commands(),
+            ) {
+                Ok(hook) => hook,
+                Err(error) => return report_failure(Failure::from(error), format),
+            };
+            print!("{hook}");
             return 0;
         }
     };
@@ -398,6 +410,7 @@ fn child_exit_code(status: ExitStatus) -> i32 {
 
 #[derive(Debug)]
 enum Failure {
+    CurrentExecutable(io::Error),
     Git(ragavan_git::Error),
     Adapter(ragavan_adapters::Error),
     Runtime(ragavan_runtime::Error),
@@ -435,6 +448,12 @@ impl From<ragavan_shell::Error> for Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CurrentExecutable(source) => {
+                write!(
+                    formatter,
+                    "could not locate the running Ragavan executable: {source}"
+                )
+            }
             Self::Git(error) => error.fmt(formatter),
             Self::Adapter(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
@@ -451,6 +470,7 @@ impl fmt::Display for Failure {
 impl std::error::Error for Failure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::CurrentExecutable(source) => Some(source),
             Self::Git(error) => Some(error),
             Self::Adapter(error) => Some(error),
             Self::Runtime(error) => Some(error),

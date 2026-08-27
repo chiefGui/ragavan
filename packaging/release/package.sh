@@ -25,7 +25,7 @@ if [ -z "$output_directory" ]; then
     echo "release output directory cannot be empty" >&2
     exit 2
 fi
-if [ -e "$output_directory" ]; then
+if [ -e "$output_directory" ] || [ -L "$output_directory" ]; then
     echo "release output path '$output_directory' already exists" >&2
     exit 1
 fi
@@ -43,7 +43,7 @@ output_parent=$(dirname -- "$output_directory")
 mkdir -p "$output_parent"
 output_parent=$(CDPATH='' cd -- "$output_parent" && pwd -P)
 output_directory="$output_parent/$output_name"
-if [ -e "$output_directory" ]; then
+if [ -e "$output_directory" ] || [ -L "$output_directory" ]; then
     echo "release output path '$output_directory' already exists" >&2
     exit 1
 fi

@@ -3,13 +3,10 @@ use crate::support::{
     ENABLED, TestRepository, assert_stdout, ragavan_command, state_home_variable, test_state_home,
 };
 use crate::support::{TempDirectory, assert_success, ragavan, stdout};
-use std::{env, path::Path, process::Command};
+use std::{env, fs, path::Path, process::Command};
 
 #[cfg(windows)]
 use crate::support::stderr;
-#[cfg(windows)]
-use std::fs;
-
 #[test]
 fn bash_wraps_package_runners_without_owning_stack_arguments() {
     let output = ragavan(TempDirectory::new().path(), &["hook", "bash"]);
@@ -51,6 +48,63 @@ fn powershell_wraps_package_runners_without_owning_stack_arguments() {
     assert!(!hook.contains("__bun-arguments"));
     assert!(!hook.contains("--port"));
     assert!(!hook.contains("--strictPort"));
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_hook_retains_the_running_native_executable() {
+    let directory = TempDirectory::new();
+    let native_executable = copied_native_executable(directory.path());
+    let output = Command::new("powershell.exe")
+        .current_dir(directory.path())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$hook = & $env:RAGAVAN_TEST_EXECUTABLE hook powershell | Out-String; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Invoke-Expression $hook; [Console]::Out.Write($global:__RagavanExecutable)",
+        ])
+        .env("RAGAVAN_TEST_EXECUTABLE", &native_executable)
+        .output()
+        .expect("PowerShell should start");
+
+    assert_success(&output);
+    assert_eq!(stdout(&output), native_executable.to_string_lossy());
+    assert_eq!(stderr(&output), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_hook_retains_the_running_native_executable() {
+    let directory = TempDirectory::new();
+    let native_executable = copied_native_executable(directory.path());
+    let output = Command::new("bash")
+        .current_dir(directory.path())
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            "hook=\"$(\"$RAGAVAN_TEST_EXECUTABLE\" hook bash)\" || exit; eval \"$hook\"; printf '%s' \"$__RagavanExecutable\"",
+        ])
+        .env("RAGAVAN_TEST_EXECUTABLE", &native_executable)
+        .output()
+        .expect("Bash should start");
+
+    assert_success(&output);
+    assert_eq!(stdout(&output), native_executable.to_string_lossy());
+    assert_eq!(crate::support::stderr(&output), "");
+}
+
+fn copied_native_executable(directory: &Path) -> std::path::PathBuf {
+    let native_directory = directory.join("native path").join("Ragavan's");
+    fs::create_dir_all(&native_directory).expect("native test directory should be created");
+    let native_executable = native_directory.join(if cfg!(windows) {
+        "ragavan.exe"
+    } else {
+        "ragavan"
+    });
+    fs::copy(env!("CARGO_BIN_EXE_ragavan"), &native_executable)
+        .expect("native Ragavan test executable should be copied");
+    native_executable
 }
 
 #[test]

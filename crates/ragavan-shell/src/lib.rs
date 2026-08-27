@@ -229,7 +229,7 @@ struct Adapter {
     matches: fn(&Path) -> bool,
     install: fn(&Selection) -> Result<InstallEdit, AdapterError>,
     uninstall: fn(&Selection) -> Result<UninstallEdit, AdapterError>,
-    hook: fn(&[&str]) -> String,
+    hook: fn(&str, &[&str]) -> String,
 }
 
 static ADAPTERS: &[Adapter] = &[bash::ADAPTER, powershell::ADAPTER];
@@ -277,9 +277,16 @@ pub fn uninstall(target: ShellTarget) -> Result<UninstallOutcome, Error> {
     }
 }
 
-pub fn hook<'a>(shell: Shell, commands: impl IntoIterator<Item = &'a str>) -> String {
+pub fn hook<'a>(
+    shell: Shell,
+    native_executable: &Path,
+    commands: impl IntoIterator<Item = &'a str>,
+) -> Result<String, Error> {
+    let native_executable = native_executable
+        .to_str()
+        .ok_or_else(|| Error::non_unicode_native_executable(native_executable))?;
     let commands: Vec<_> = commands.into_iter().collect();
-    (shell.0.hook)(&commands)
+    Ok((shell.0.hook)(native_executable, &commands))
 }
 
 struct ResolvedAdapter {
@@ -320,6 +327,7 @@ pub struct Error(ErrorKind);
 #[derive(Debug)]
 enum ErrorKind {
     UnsupportedCurrentShell,
+    NonUnicodeNativeExecutable(PathBuf),
     Detection(detection::Error),
     Adapter(AdapterError),
 }
@@ -327,6 +335,10 @@ enum ErrorKind {
 impl Error {
     fn unsupported_current_shell() -> Self {
         Self(ErrorKind::UnsupportedCurrentShell)
+    }
+
+    fn non_unicode_native_executable(path: &Path) -> Self {
+        Self(ErrorKind::NonUnicodeNativeExecutable(path.to_owned()))
     }
 
     fn detection(error: detection::Error) -> Self {
@@ -357,6 +369,10 @@ impl fmt::Display for Error {
                 }
                 Ok(())
             }
+            ErrorKind::NonUnicodeNativeExecutable(path) => write!(
+                formatter,
+                "could not render shell integration because the running Ragavan executable path is not valid Unicode: {path:?}"
+            ),
             ErrorKind::Detection(error) => error.fmt(formatter),
             ErrorKind::Adapter(source) => source.fmt(formatter),
         }
@@ -366,7 +382,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.0 {
-            ErrorKind::UnsupportedCurrentShell => None,
+            ErrorKind::UnsupportedCurrentShell | ErrorKind::NonUnicodeNativeExecutable(_) => None,
             ErrorKind::Detection(error) => Some(error),
             ErrorKind::Adapter(source) => Some(source.as_ref()),
         }
@@ -387,5 +403,36 @@ mod tests {
             assert_eq!(shell(registered.name()), Some(registered));
         }
         assert!(!names.is_empty());
+    }
+
+    #[test]
+    fn hook_rejects_a_non_unicode_native_executable() {
+        let error = hook(
+            shell("bash").expect("Bash should be registered"),
+            &non_unicode_path(),
+            std::iter::empty(),
+        )
+        .expect_err("shell integration is text and must reject a non-Unicode path");
+
+        assert!(error.to_string().contains("not valid Unicode"));
+    }
+
+    #[cfg(unix)]
+    fn non_unicode_path() -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(vec![b'/', 0xff]))
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_path() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xd800,
+        ]))
     }
 }

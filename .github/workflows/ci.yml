@@ -41,5 +41,13 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: Install pinned Node.js runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features
+
+      - name: Test npm packaging
+        run: node --test packaging/platforms.test.mjs packaging/npm/package.test.mjs
