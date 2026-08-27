@@ -5,126 +5,223 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Existing release tag to rebuild and resubmit during moderation
-        required: true
-        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ inputs.release_tag || github.ref_name }}
+  group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
-    name: Release
-    runs-on: windows-latest
-    env:
-      CARGO_TERM_COLOR: always
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pinned Rust toolchain
         run: rustup show
 
-      - name: Verify release version
+      - name: Resolve release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -er '
+                [.packages[] | select(.name == "ragavan") | .version]
+                | if length == 1 then .[0]
+                  else error("expected exactly one Cargo package named ragavan")
+                  end
+              '
+          )"
+          tag="v${version}"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "${tag}" ]]; then
+            echo "Release tag '${GITHUB_REF_NAME}' must match Cargo version '${tag}'." >&2
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: ragavan.exe
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: ragavan
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: ragavan
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: ragavan
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install Linux target support
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Install release target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Test release target
+        run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --package ragavan --target ${{ matrix.target }}
+
+      - name: Verify Windows release binary
+        if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RAGAVAN_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $binary = (Resolve-Path -LiteralPath 'target\${{ matrix.target }}\release\${{ matrix.binary }}').Path
+          $actualVersion = (& $binary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+              throw "The release binary failed with exit code $LASTEXITCODE."
+          }
+          if ($actualVersion -cne "ragavan $env:RAGAVAN_VERSION") {
+              throw "Expected 'ragavan $env:RAGAVAN_VERSION', received '$actualVersion'."
+          }
+
+          .\packaging\release\assert-static-msvc-runtime.ps1 -Executable $binary
+
+      - name: Verify Unix release binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RAGAVAN_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          actual_version="$("${binary}" --version)"
+          expected_version="ragavan ${RAGAVAN_VERSION}"
+          if [[ "${actual_version}" != "${expected_version}" ]]; then
+            echo "Expected '${expected_version}', received '${actual_version}'." >&2
+            exit 1
+          fi
+
+      - name: Verify static Linux release binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if readelf --dynamic "${binary}" | grep --quiet '(NEEDED)'; then
+            echo "The Linux release binary has dynamic library dependencies." >&2
+            exit 1
+          fi
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Package release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binary-*
+          path: target/release-inputs
+          merge-multiple: false
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          sh packaging/release/package.sh \
+            '${{ needs.prepare.outputs.version }}' \
+            target/release-inputs \
+            target/distribution
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ needs.prepare.outputs.version }}
+          path: target/distribution/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    if: github.event_name == 'push'
+    needs:
+      - prepare
+      - package
+    runs-on: ubuntu-24.04
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ needs.prepare.outputs.version }}
+          path: target/distribution
+
+      - name: Generate release provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: target/distribution/*
+
+      - name: Publish GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_REPO: ${{ github.repository }}
+          RAGAVAN_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          $packages = @($metadata.packages | Where-Object { $_.name -eq 'ragavan' })
-          if ($packages.Count -ne 1) {
-              throw "Expected exactly one Cargo package named 'ragavan'; found $($packages.Count)."
-          }
+          set -euo pipefail
 
-          $version = [string] $packages[0].version
-          $expectedTag = "v$version"
-          $releaseTag = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
-              $env:REQUESTED_RELEASE_TAG
-          }
-          else {
-              $env:GITHUB_REF_NAME
-          }
-
-          if ($releaseTag -cne $expectedTag) {
-              throw "Release tag '$releaseTag' must match Cargo version '$expectedTag'."
-          }
-
-          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
-              gh release view $releaseTag | Out-Null
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Manual resubmission requires an existing GitHub release for '$releaseTag'."
-              }
-          }
-
-          "RAGAVAN_VERSION=$version" >> $env:GITHUB_ENV
-          "RAGAVAN_RELEASE_TAG=$releaseTag" >> $env:GITHUB_ENV
-          $sourceReference = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
-              $env:GITHUB_SHA
-          }
-          else {
-              $releaseTag
-          }
-          "RAGAVAN_SOURCE_REFERENCE=$sourceReference" >> $env:GITHUB_ENV
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test --workspace --all-targets --all-features
-
-      - name: Build release artifacts
-        shell: pwsh
-        run: |
-          .\packaging\chocolatey\pack.ps1 `
-              -Version $env:RAGAVAN_VERSION `
-              -SourceReference $env:RAGAVAN_SOURCE_REFERENCE
-
-      - name: Publish GitHub release assets
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $artifacts = @(
-              'target\distribution\ragavan.exe',
-              'target\distribution\ragavan.exe.sha256',
-              "target\distribution\ragavan.$env:RAGAVAN_VERSION.nupkg"
-          )
-
-          gh release view $env:RAGAVAN_RELEASE_TAG 2>$null | Out-Null
-          $releaseExists = $LASTEXITCODE -eq 0
-
-          if ($releaseExists) {
-              gh release upload $env:RAGAVAN_RELEASE_TAG $artifacts --clobber
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Could not replace assets for '$env:RAGAVAN_RELEASE_TAG'."
-              }
-          }
-          else {
-              gh release create $env:RAGAVAN_RELEASE_TAG $artifacts `
-                  --verify-tag `
-                  --generate-notes `
-                  --title "Ragavan $env:RAGAVAN_RELEASE_TAG"
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Could not create release '$env:RAGAVAN_RELEASE_TAG'."
-              }
-          }
-
-      - name: Publish Chocolatey package
-        shell: pwsh
-        env:
-          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
-        run: |
-          $package = "target\distribution\ragavan.$env:RAGAVAN_VERSION.nupkg"
-          choco push $package `
-              --source 'https://push.chocolatey.org/' `
-              --api-key $env:CHOCOLATEY_API_KEY
+          if gh release view "${RAGAVAN_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RAGAVAN_TAG}" target/distribution/* --clobber
+          else
+            gh release create "${RAGAVAN_TAG}" target/distribution/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Ragavan ${RAGAVAN_TAG}"
+          fi
