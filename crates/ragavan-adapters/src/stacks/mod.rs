@@ -3,6 +3,7 @@ mod vite;
 
 use crate::script::{Invocation, Script};
 use ragavan_core::Port;
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{ffi::OsString, fmt, path::PathBuf};
 
 struct Stack {
@@ -63,7 +64,7 @@ pub(super) fn resolve(script: ResolvedScript<'_>) -> Result<StackAdjustment, Err
 
 #[derive(Debug)]
 pub(super) enum Error {
-    Adapter(Box<dyn std::error::Error>),
+    Adapter(Box<dyn Diagnostic>),
     UnsupportedScript {
         invocation: &'static str,
         path: PathBuf,
@@ -82,7 +83,7 @@ pub(super) enum Error {
 }
 
 impl Error {
-    fn adapter(error: impl std::error::Error + 'static) -> Self {
+    fn adapter(error: impl Diagnostic + 'static) -> Self {
         Self::Adapter(Box::new(error))
     }
 }
@@ -129,6 +130,58 @@ impl std::error::Error for Error {
             Self::UnsupportedScript { .. }
             | Self::AmbiguousScript { .. }
             | Self::UnsafeArgumentDelivery { .. } => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Adapter(error) => error.code(),
+            Self::UnsupportedScript { .. } => "stack.unrecognized",
+            Self::AmbiguousScript { .. } => "stack.ambiguous",
+            Self::UnsafeArgumentDelivery { .. } => "stack.argument_delivery.unsafe",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match self {
+            Self::Adapter(error) => error.help(),
+            Self::UnsupportedScript { .. } => Some(
+                "use a supported development server command as the script's final command"
+                    .to_owned(),
+            ),
+            Self::AmbiguousScript { .. } => Some(
+                "leave exactly one supported development server in the package script".to_owned(),
+            ),
+            Self::UnsafeArgumentDelivery { .. } => Some(
+                "move the supported development server to the end of the package script".to_owned(),
+            ),
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::Adapter(error) => error.details(),
+            Self::UnsupportedScript {
+                invocation,
+                path,
+                script,
+            }
+            | Self::AmbiguousScript {
+                invocation,
+                path,
+                script,
+            }
+            | Self::UnsafeArgumentDelivery {
+                invocation,
+                path,
+                script,
+            } => vec![
+                Detail::text("invocation", *invocation),
+                Detail::text("package", path.display().to_string()),
+                Detail::text("script", script),
+            ],
         }
     }
 }

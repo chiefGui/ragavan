@@ -7,6 +7,7 @@ mod stacks;
 
 use package::PackageTarget;
 use ragavan_core::{LaunchPlan, Port, ServiceScope};
+use ragavan_diagnostics::{Detail, Diagnostic};
 use script::Script;
 use std::{
     ffi::{OsStr, OsString},
@@ -159,5 +160,46 @@ impl std::error::Error for Error {
             ErrorKind::UnsupportedSyntax { source, .. } => Some(source),
             ErrorKind::Stack(error) => Some(error),
         }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match &self.0 {
+            ErrorKind::Package { source, .. } => source.code(),
+            ErrorKind::UnsupportedSyntax { source, .. } => source.code(),
+            ErrorKind::Stack(error) => error.code(),
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match &self.0 {
+            ErrorKind::Package { source, .. } => source.help(),
+            ErrorKind::UnsupportedSyntax { source, .. } => source.help(),
+            ErrorKind::Stack(error) => error.help(),
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        let (invocation, path, script, source): (_, Option<&Path>, Option<&str>, &dyn Diagnostic) =
+            match &self.0 {
+                ErrorKind::Package { invocation, source } => (*invocation, None, None, source),
+                ErrorKind::UnsupportedSyntax {
+                    invocation,
+                    path,
+                    script,
+                    source,
+                } => (*invocation, Some(path), Some(script), source),
+                ErrorKind::Stack(error) => return error.details(),
+            };
+        let mut details = vec![Detail::text("invocation", invocation)];
+        if let Some(path) = path {
+            details.push(Detail::text("package", path.display().to_string()));
+        }
+        if let Some(script) = script {
+            details.push(Detail::text("script", script));
+        }
+        details.extend(source.details());
+        details
     }
 }

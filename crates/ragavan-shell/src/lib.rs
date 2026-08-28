@@ -5,6 +5,7 @@ mod detection;
 mod powershell;
 mod profile;
 
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     ffi::{OsStr, OsString},
     fmt,
@@ -13,6 +14,8 @@ use std::{
 
 pub mod protocol {
     use super::{OsStr, OsString};
+    use ragavan_diagnostics::Diagnostic;
+    use std::fmt;
 
     pub const RUN_COMMAND: &str = "__run";
 
@@ -41,7 +44,7 @@ pub mod protocol {
         }
     }
 
-    pub fn parse(arguments: &[OsString]) -> Result<Option<RunRequest<'_>>, &'static str> {
+    pub fn parse(arguments: &[OsString]) -> Result<Option<RunRequest<'_>>, Error> {
         let Some((operation, arguments)) = arguments.split_first() else {
             return Ok(None);
         };
@@ -50,16 +53,16 @@ pub mod protocol {
         }
 
         let [command, program, launch_argument_count, remaining @ ..] = arguments else {
-            return Err("the loaded shell integration sent a malformed command to Ragavan");
+            return Err(Error);
         };
         let Some(launch_argument_count) = launch_argument_count
             .to_str()
             .and_then(|count| count.parse::<usize>().ok())
         else {
-            return Err("the loaded shell integration sent a malformed command to Ragavan");
+            return Err(Error);
         };
         if command.is_empty() || program.is_empty() || launch_argument_count > remaining.len() {
-            return Err("the loaded shell integration sent a malformed command to Ragavan");
+            return Err(Error);
         }
         let (launch_arguments, arguments) = remaining.split_at(launch_argument_count);
 
@@ -69,6 +72,27 @@ pub mod protocol {
             launch_arguments,
             arguments,
         }))
+    }
+
+    #[derive(Debug)]
+    pub struct Error;
+
+    impl fmt::Display for Error {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("the loaded shell integration sent a malformed command to Ragavan")
+        }
+    }
+
+    impl std::error::Error for Error {}
+
+    impl Diagnostic for Error {
+        fn code(&self) -> &'static str {
+            "shell.protocol.malformed"
+        }
+
+        fn help(&self) -> Option<String> {
+            Some("run `ragavan install` again to refresh the shell integration".to_owned())
+        }
     }
 
     #[cfg(test)]
@@ -200,7 +224,11 @@ impl UninstallOutcome {
     }
 }
 
-type AdapterError = Box<dyn std::error::Error>;
+type AdapterError = Box<dyn Diagnostic>;
+
+fn adapter_error(error: impl Diagnostic + 'static) -> AdapterError {
+    Box::new(error)
+}
 
 struct InstallEdit {
     profiles: Vec<PathBuf>,
@@ -306,7 +334,7 @@ fn resolve(target: ShellTarget) -> Result<ResolvedAdapter, Error> {
             let adapter = ADAPTERS
                 .iter()
                 .find(|adapter| (adapter.matches)(process.command()))
-                .ok_or_else(Error::unsupported_current_shell)?;
+                .ok_or_else(|| Error::unsupported_current_shell(process.command()))?;
             Ok(ResolvedAdapter {
                 adapter,
                 selection: Selection::Detected {
@@ -326,15 +354,15 @@ pub struct Error(ErrorKind);
 
 #[derive(Debug)]
 enum ErrorKind {
-    UnsupportedCurrentShell,
+    UnsupportedCurrentShell(PathBuf),
     NonUnicodeNativeExecutable(PathBuf),
     Detection(detection::Error),
     Adapter(AdapterError),
 }
 
 impl Error {
-    fn unsupported_current_shell() -> Self {
-        Self(ErrorKind::UnsupportedCurrentShell)
+    fn unsupported_current_shell(command: &Path) -> Self {
+        Self(ErrorKind::UnsupportedCurrentShell(command.to_owned()))
     }
 
     fn non_unicode_native_executable(path: &Path) -> Self {
@@ -353,7 +381,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
-            ErrorKind::UnsupportedCurrentShell => {
+            ErrorKind::UnsupportedCurrentShell(_) => {
                 formatter.write_str(
                     "could not detect a supported current shell; rerun the command with ",
                 )?;
@@ -382,9 +410,52 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.0 {
-            ErrorKind::UnsupportedCurrentShell | ErrorKind::NonUnicodeNativeExecutable(_) => None,
+            ErrorKind::UnsupportedCurrentShell(_) | ErrorKind::NonUnicodeNativeExecutable(_) => {
+                None
+            }
             ErrorKind::Detection(error) => Some(error),
             ErrorKind::Adapter(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match &self.0 {
+            ErrorKind::UnsupportedCurrentShell(_) => "shell.unsupported",
+            ErrorKind::NonUnicodeNativeExecutable(_) => "shell.executable.non_unicode",
+            ErrorKind::Detection(error) => error.code(),
+            ErrorKind::Adapter(source) => source.code(),
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match &self.0 {
+            ErrorKind::UnsupportedCurrentShell(_) => Some(format!(
+                "select a supported shell explicitly: {}",
+                ADAPTERS
+                    .iter()
+                    .map(|adapter| format!("`{}`", adapter.name))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )),
+            ErrorKind::NonUnicodeNativeExecutable(_) => None,
+            ErrorKind::Detection(error) => error.help(),
+            ErrorKind::Adapter(source) => source.help(),
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match &self.0 {
+            ErrorKind::UnsupportedCurrentShell(command) => vec![
+                Detail::text("detected", command.display().to_string()),
+                Detail::list("supported", ADAPTERS.iter().map(|adapter| adapter.name)),
+            ],
+            ErrorKind::NonUnicodeNativeExecutable(path) => {
+                vec![Detail::text("executable", path.to_string_lossy())]
+            }
+            ErrorKind::Detection(error) => error.details(),
+            ErrorKind::Adapter(source) => source.details(),
         }
     }
 }

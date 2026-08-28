@@ -4,6 +4,7 @@
 //! trailing arguments to one invocation. Other shell control flow remains
 //! unsupported until its argument-delivery semantics can be proven.
 
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{fmt, iter::Peekable, path::Path, str::CharIndices};
 
 pub(super) struct Script {
@@ -372,6 +373,39 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self.kind {
+            ErrorKind::EmptyScript => "script.empty",
+            ErrorKind::MissingCommand => "script.command.missing",
+            ErrorKind::MissingCommandAfterAnd => "script.and_command.missing",
+            ErrorKind::MissingExecutable => "script.executable.missing",
+            ErrorKind::TrailingEscape => "script.escape.incomplete",
+            ErrorKind::UnclosedSingleQuote => "script.single_quote.unclosed",
+            ErrorKind::UnclosedDoubleQuote => "script.double_quote.unclosed",
+            ErrorKind::UnsupportedComment => "script.comment.unsupported",
+            ErrorKind::UnsupportedExpansion => "script.expansion.unsupported",
+            ErrorKind::UnsupportedNewline => "script.newline.unsupported",
+            ErrorKind::UnsupportedOperator(_) => "script.operator.unsupported",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        Some(
+            "use a static package script with environment assignments, quoted arguments, and optional `&&` setup commands"
+                .to_owned(),
+        )
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        let mut details = vec![Detail::number("byte", self.position as u64)];
+        if let ErrorKind::UnsupportedOperator(operator) = self.kind {
+            details.push(Detail::text("operator", operator.to_string()));
+        }
+        details
+    }
+}
 
 #[cfg(test)]
 mod tests {

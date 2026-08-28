@@ -3,6 +3,7 @@ mod plus;
 use super::{Error as StackError, Stack, StackAdjustment};
 use crate::script::Invocation;
 use ragavan_core::Port;
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{ffi::OsString, fmt};
 
 pub(super) use plus::ADAPTER as PLUS_ADAPTER;
@@ -71,3 +72,23 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::ExplicitPort { .. } => "stack.vite.port_conflict",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        Some("remove the explicit Vite port and let Ragavan provide it".to_owned())
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::ExplicitPort { invocation } => {
+                vec![Detail::text("invocation", *invocation)]
+            }
+        }
+    }
+}

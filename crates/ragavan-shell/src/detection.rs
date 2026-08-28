@@ -1,3 +1,4 @@
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     fmt, io,
     path::{Path, PathBuf},
@@ -251,6 +252,56 @@ impl std::error::Error for Error {
             Self::Helper { .. } | Self::UnexpectedOutput(_) => None,
             #[cfg(target_os = "linux")]
             Self::MalformedProcess(_) => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::StartHelper { .. } => "shell.detection.start",
+            #[cfg(not(target_os = "linux"))]
+            Self::Helper { .. } => "shell.detection.command",
+            #[cfg(not(target_os = "linux"))]
+            Self::NonUtf8Output(_) => "shell.detection.output.non_utf8",
+            #[cfg(not(target_os = "linux"))]
+            Self::UnexpectedOutput(_) => "shell.detection.output.unexpected",
+            #[cfg(target_os = "linux")]
+            Self::ReadProcess { .. } => "shell.detection.process.read",
+            #[cfg(target_os = "linux")]
+            Self::MalformedProcess(_) => "shell.detection.process.malformed",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        Some("select a supported shell explicitly when running the command".to_owned())
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::StartHelper { executable, .. } => {
+                vec![Detail::text("executable", executable.display().to_string())]
+            }
+            #[cfg(not(target_os = "linux"))]
+            Self::Helper {
+                executable,
+                status,
+                detail,
+            } => vec![
+                Detail::text("executable", executable.display().to_string()),
+                Detail::text("status", status.to_string()),
+                Detail::text("output", detail),
+            ],
+            #[cfg(not(target_os = "linux"))]
+            Self::NonUtf8Output(_) => Vec::new(),
+            #[cfg(not(target_os = "linux"))]
+            Self::UnexpectedOutput(output) => vec![Detail::text("output", output)],
+            #[cfg(target_os = "linux")]
+            Self::ReadProcess { path, .. } | Self::MalformedProcess(path) => {
+                vec![Detail::text("path", path.display().to_string())]
+            }
         }
     }
 }

@@ -1,20 +1,25 @@
 #![forbid(unsafe_code)]
 
+mod enrollment;
+mod integration;
+mod presentation;
+
 use clap::{
     CommandFactory, Parser, Subcommand,
     builder::{PossibleValuesParser, TypedValueParser},
-    error::ErrorKind,
+    error::{ContextKind, ContextValue, ErrorKind},
 };
-use ragavan_core::{Enrollment, LaunchPlan, ServiceIdentity};
-use serde_json::{Value, json};
+use presentation::Format;
+use ragavan_core::{LaunchPlan, ServiceIdentity};
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     env,
     ffi::OsString,
-    fmt, io,
+    io,
+    path::Path,
     process::{Command as ProcessCommand, ExitStatus},
 };
-
-const JSON_SCHEMA_VERSION: u8 = 2;
+use thiserror::Error;
 
 /// Run Ragavan's command-line interface and return its process status code.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
@@ -23,10 +28,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
     match ragavan_shell::protocol::parse(arguments.get(1..).unwrap_or_default()) {
         Ok(Some(request)) => return run_command(request),
         Ok(None) => {}
-        Err(message) => {
-            eprintln!("error: {message}");
-            return 1;
-        }
+        Err(error) => return presentation::report(&error, Format::Human, 1),
     }
 
     let json_requested = arguments.iter().any(|argument| argument == "--json");
@@ -35,38 +37,44 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
         Err(error) => return report_parse_error(error, json_requested),
     };
     let format = if cli.json {
-        OutputFormat::Json
+        Format::Json
     } else {
-        OutputFormat::Human
+        Format::Human
     };
     let Some(command) = cli.command else {
-        if format == OutputFormat::Json {
-            return report_usage("missing command", format);
+        if format == Format::Json {
+            return report_usage(
+                "cli.command.missing",
+                "a command is required",
+                Some("run `ragavan --help` to list available commands"),
+                format,
+            );
         }
-        print!("{}", Cli::command().render_help());
-        return 0;
+        return report_output(
+            presentation::print(Cli::command().render_help()),
+            "command help",
+            format,
+        );
     };
 
-    let outcome = match command {
-        Command::Install { shell } => ragavan_shell::install(shell_target(shell))
-            .map(Outcome::Installation)
-            .map_err(Failure::from),
-        Command::Uninstall { shell } => ragavan_shell::uninstall(shell_target(shell))
-            .map(Outcome::Uninstallation)
-            .map_err(Failure::from),
-        Command::Enable => ragavan_git::enable()
-            .map(Outcome::Enrollment)
-            .map_err(Failure::from),
-        Command::Status => ragavan_git::status()
-            .map(Outcome::Enrollment)
-            .map_err(Failure::from),
-        Command::Disable => ragavan_git::disable()
-            .map(Outcome::Enrollment)
-            .map_err(Failure::from),
+    match command {
+        Command::Install { shell } => complete(
+            ragavan_shell::install(shell_target(shell)).map_err(Failure::from),
+            format,
+        ),
+        Command::Uninstall { shell } => complete(
+            ragavan_shell::uninstall(shell_target(shell)).map_err(Failure::from),
+            format,
+        ),
+        Command::Enable => complete(ragavan_git::enable().map_err(Failure::from), format),
+        Command::Status => complete(ragavan_git::status().map_err(Failure::from), format),
+        Command::Disable => complete(ragavan_git::disable().map_err(Failure::from), format),
         Command::Hook { shell } => {
-            if format == OutputFormat::Json {
+            if format == Format::Json {
                 return report_usage(
+                    "cli.output.unsupported",
                     "structured output is unavailable for `hook`; its output is the shell integration",
+                    Some("run `ragavan hook` without `--json`"),
                     format,
                 );
             }
@@ -84,16 +92,18 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
                 Ok(hook) => hook,
                 Err(error) => return report_failure(Failure::from(error), format),
             };
-            print!("{hook}");
-            return 0;
+            report_output(presentation::print(hook), "shell integration", format)
         }
-    };
+    }
+}
 
-    match outcome {
-        Ok(outcome) => {
-            outcome.print(format);
-            0
-        }
+fn complete(result: Result<impl presentation::Response, Failure>, format: Format) -> i32 {
+    match result {
+        Ok(response) => report_output(
+            presentation::present(&response, format),
+            "command result",
+            format,
+        ),
         Err(error) => report_failure(error, format),
     }
 }
@@ -103,7 +113,8 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
     name = "ragavan",
     bin_name = "ragavan",
     version,
-    about = "Zero-configuration isolation for concurrent Git worktrees"
+    about = "Zero-configuration isolation for concurrent Git worktrees",
+    styles = presentation::CLI_STYLES
 )]
 struct Cli {
     /// Print command results and errors as JSON.
@@ -153,205 +164,179 @@ fn shell_target(shell: Option<ragavan_shell::Shell>) -> ragavan_shell::ShellTarg
     })
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum OutputFormat {
-    Human,
-    Json,
-}
-
-enum Outcome {
-    Installation(ragavan_shell::InstallOutcome),
-    Uninstallation(ragavan_shell::UninstallOutcome),
-    Enrollment(Enrollment),
-}
-
-impl Outcome {
-    fn print(self, format: OutputFormat) {
-        match format {
-            OutputFormat::Human => self.print_human(),
-            OutputFormat::Json => println!("{}", self.json()),
-        }
-    }
-
-    fn print_human(self) {
-        match self {
-            Self::Installation(outcome) => print_installation(outcome),
-            Self::Uninstallation(outcome) => print_uninstallation(outcome),
-            Self::Enrollment(enrollment) => println!("{}", enrollment_message(enrollment)),
-        }
-    }
-
-    fn json(self) -> Value {
-        match self {
-            Self::Installation(outcome) => {
-                let shell = outcome.shell().name();
-                json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "integration": {
-                        "shell": shell,
-                        "state": match outcome {
-                            ragavan_shell::InstallOutcome::Installed { .. } => "installed",
-                            ragavan_shell::InstallOutcome::AlreadyInstalled { .. } => "already_installed",
-                        },
-                        "profiles": outcome
-                            .profiles()
-                            .iter()
-                            .map(|profile| profile.to_string_lossy())
-                            .collect::<Vec<_>>(),
-                    },
-                })
-            }
-            Self::Uninstallation(outcome) => {
-                let shell = outcome.shell().name();
-                json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "integration": {
-                        "shell": shell,
-                        "state": match outcome {
-                            ragavan_shell::UninstallOutcome::Uninstalled { .. } => "uninstalled",
-                            ragavan_shell::UninstallOutcome::AlreadyUninstalled { .. } => "already_uninstalled",
-                        },
-                        "profiles": outcome
-                            .profiles()
-                            .iter()
-                            .map(|profile| profile.to_string_lossy())
-                            .collect::<Vec<_>>(),
-                    },
-                })
-            }
-            Self::Enrollment(enrollment) => json!({
-                "schema_version": JSON_SCHEMA_VERSION,
-                "enrollment": match enrollment {
-                    Enrollment::Enabled => "enabled",
-                    Enrollment::Disabled => "disabled",
-                },
-            }),
-        }
-    }
-}
-
 fn report_parse_error(error: clap::Error, json_requested: bool) -> i32 {
     if matches!(
         error.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     ) {
         if let Err(source) = error.print() {
-            eprintln!("error: could not print command help: {source}");
-            return 1;
+            return report_failure(
+                Failure::WriteOutput {
+                    output: "command help",
+                    source,
+                },
+                Format::Human,
+            );
         }
         return 0;
     }
 
-    if json_requested {
-        print_json_error("usage", error.to_string().trim_end());
-    } else if let Err(source) = error.print() {
-        eprintln!("error: could not print command error: {source}");
-        return 1;
-    }
-    2
+    let diagnostic = UsageError::from_clap(&error);
+    presentation::report(
+        &diagnostic,
+        if json_requested {
+            Format::Json
+        } else {
+            Format::Human
+        },
+        2,
+    )
 }
 
-fn report_usage(message: &str, format: OutputFormat) -> i32 {
-    match format {
-        OutputFormat::Human => eprintln!("error: {message}"),
-        OutputFormat::Json => print_json_error("usage", message),
-    }
-    2
+fn report_usage(code: &'static str, message: &str, help: Option<&str>, format: Format) -> i32 {
+    presentation::report(
+        &UsageError {
+            code,
+            message: message.to_owned(),
+            help: help.map(str::to_owned),
+            details: Vec::new(),
+        },
+        format,
+        2,
+    )
 }
 
-fn report_failure(error: Failure, format: OutputFormat) -> i32 {
-    match format {
-        OutputFormat::Human => eprintln!("error: {error}"),
-        OutputFormat::Json => print_json_error("operation", &error.to_string()),
-    }
-    1
+fn report_failure(error: Failure, format: Format) -> i32 {
+    presentation::report(&error, format, 1)
 }
 
-fn print_json_error(kind: &str, message: &str) {
-    eprintln!(
-        "{}",
-        json!({
-            "schema_version": JSON_SCHEMA_VERSION,
-            "error": {
-                "kind": kind,
-                "message": message,
-            },
+fn report_output(result: io::Result<()>, output: &'static str, format: Format) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(source) => report_failure(Failure::WriteOutput { output, source }, format),
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+struct UsageError {
+    code: &'static str,
+    message: String,
+    help: Option<String>,
+    details: Vec<Detail>,
+}
+
+impl UsageError {
+    fn from_clap(error: &clap::Error) -> Self {
+        let message = error.to_string();
+        let message = message
+            .strip_prefix("error: ")
+            .unwrap_or(&message)
+            .split("\n\n")
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned();
+        Self {
+            code: clap_error_code(error.kind()),
+            message,
+            help: clap_error_help(error),
+            details: clap_error_details(error),
+        }
+    }
+}
+
+impl Diagnostic for UsageError {
+    fn code(&self) -> &'static str {
+        self.code
+    }
+
+    fn help(&self) -> Option<String> {
+        self.help.clone()
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        self.details.clone()
+    }
+}
+
+fn clap_error_code(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => "cli.value.invalid",
+        ErrorKind::UnknownArgument => "cli.argument.unknown",
+        ErrorKind::InvalidSubcommand => "cli.command.invalid",
+        ErrorKind::NoEquals => "cli.value.equals_required",
+        ErrorKind::TooManyValues => "cli.value.too_many",
+        ErrorKind::TooFewValues => "cli.value.too_few",
+        ErrorKind::WrongNumberOfValues => "cli.value.count_invalid",
+        ErrorKind::ArgumentConflict => "cli.argument.conflict",
+        ErrorKind::MissingRequiredArgument => "cli.argument.missing",
+        ErrorKind::MissingSubcommand => "cli.command.missing",
+        ErrorKind::InvalidUtf8 => "cli.argument.non_unicode",
+        ErrorKind::Io => "cli.output.write",
+        ErrorKind::Format => "cli.output.format",
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion => "cli.display",
+        _ => "cli.usage.invalid",
+    }
+}
+
+fn clap_error_help(error: &clap::Error) -> Option<String> {
+    for kind in [
+        ContextKind::SuggestedCommand,
+        ContextKind::SuggestedSubcommand,
+        ContextKind::SuggestedArg,
+        ContextKind::SuggestedValue,
+        ContextKind::Suggested,
+    ] {
+        if let Some(value) = error.get(kind) {
+            return Some(format!("try `{value}`"));
+        }
+    }
+    Some("run `ragavan --help` to see available commands and options".to_owned())
+}
+
+fn clap_error_details(error: &clap::Error) -> Vec<Detail> {
+    error
+        .context()
+        .filter_map(|(kind, value)| {
+            let name = match kind {
+                ContextKind::InvalidSubcommand => "invalid_subcommand",
+                ContextKind::InvalidArg => "invalid_argument",
+                ContextKind::PriorArg => "prior_argument",
+                ContextKind::ValidSubcommand => "valid_subcommands",
+                ContextKind::ValidValue => "valid_values",
+                ContextKind::InvalidValue => "invalid_value",
+                ContextKind::ActualNumValues => "actual_value_count",
+                ContextKind::ExpectedNumValues => "expected_value_count",
+                ContextKind::MinValues => "minimum_value_count",
+                ContextKind::SuggestedCommand => "suggested_command",
+                ContextKind::SuggestedSubcommand => "suggested_subcommand",
+                ContextKind::SuggestedArg => "suggested_argument",
+                ContextKind::SuggestedValue => "suggested_value",
+                ContextKind::TrailingArg => "trailing_argument",
+                ContextKind::Suggested => "suggested",
+                ContextKind::Usage | ContextKind::Custom => return None,
+                _ => return None,
+            };
+            Some(match value {
+                ContextValue::Strings(values) => Detail::list(name, values),
+                ContextValue::StyledStrs(values) => {
+                    Detail::list(name, values.iter().map(ToString::to_string))
+                }
+                ContextValue::Number(value) if *value >= 0 => Detail::number(name, *value as u64),
+                ContextValue::None => return None,
+                _ => Detail::text(name, value.to_string()),
+            })
         })
-    );
-}
-
-fn print_installation(outcome: ragavan_shell::InstallOutcome) {
-    let shell = outcome.shell();
-    match &outcome {
-        ragavan_shell::InstallOutcome::Installed { .. } => {
-            println!("Ragavan is installed for {}.", shell.display_name());
-        }
-        ragavan_shell::InstallOutcome::AlreadyInstalled { .. } => {
-            println!("Ragavan is already installed for {}.", shell.display_name());
-        }
-    }
-    print_profiles(outcome.profiles());
-    println!(
-        "Future {} sessions will load Ragavan automatically.",
-        shell.display_name()
-    );
-    println!(
-        "To activate Ragavan in an existing {} session, run `{}`.",
-        shell.display_name(),
-        shell.activation_command()
-    );
-}
-
-fn print_uninstallation(outcome: ragavan_shell::UninstallOutcome) {
-    let shell = outcome.shell();
-    match &outcome {
-        ragavan_shell::UninstallOutcome::Uninstalled { .. } => {
-            println!("Ragavan is uninstalled from {}.", shell.display_name());
-            print_profiles(outcome.profiles());
-            println!(
-                "Future {} sessions will no longer load Ragavan automatically.",
-                shell.display_name()
-            );
-            println!(
-                "Loaded integration remains active in existing sessions until they are closed."
-            );
-        }
-        ragavan_shell::UninstallOutcome::AlreadyUninstalled { .. } => {
-            println!(
-                "Ragavan is already uninstalled from {}.",
-                shell.display_name()
-            );
-        }
-    }
-}
-
-fn print_profiles(profiles: &[std::path::PathBuf]) {
-    match profiles {
-        [] => {}
-        [profile] => println!("Profile: {}", profile.display()),
-        profiles => {
-            println!("Profiles:");
-            for profile in profiles {
-                println!("  {}", profile.display());
-            }
-        }
-    }
-}
-
-fn enrollment_message(enrollment: Enrollment) -> &'static str {
-    match enrollment {
-        Enrollment::Enabled => "Ragavan is enabled for this repository.",
-        Enrollment::Disabled => "Ragavan is disabled for this repository.",
-    }
+        .collect()
 }
 
 fn run_command(request: ragavan_shell::protocol::RunRequest<'_>) -> i32 {
     match execute_command(&request) {
         Ok(status) => child_exit_code(status),
-        Err(error) => {
-            eprintln!("error: {error}");
-            1
-        }
+        Err(error) => presentation::report(&error, Format::Human, 1),
     }
 }
 
@@ -408,74 +393,71 @@ fn child_exit_code(status: ExitStatus) -> i32 {
     1
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 enum Failure {
-    CurrentExecutable(io::Error),
-    Git(ragavan_git::Error),
-    Adapter(ragavan_adapters::Error),
-    Runtime(ragavan_runtime::Error),
-    Shell(ragavan_shell::Error),
+    #[error("could not locate the running Ragavan executable: {0}")]
+    CurrentExecutable(#[source] io::Error),
+    #[error(transparent)]
+    Git(#[from] ragavan_git::Error),
+    #[error(transparent)]
+    Adapter(#[from] ragavan_adapters::Error),
+    #[error(transparent)]
+    Runtime(#[from] ragavan_runtime::Error),
+    #[error(transparent)]
+    Shell(#[from] ragavan_shell::Error),
+    #[error("could not run {}: {source}", Path::new(.program).display())]
     RunCommand {
         program: OsString,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not write {output}: {source}")]
+    WriteOutput {
+        output: &'static str,
+        #[source]
         source: io::Error,
     },
 }
 
-impl From<ragavan_git::Error> for Failure {
-    fn from(error: ragavan_git::Error) -> Self {
-        Self::Git(error)
-    }
-}
-
-impl From<ragavan_adapters::Error> for Failure {
-    fn from(error: ragavan_adapters::Error) -> Self {
-        Self::Adapter(error)
-    }
-}
-
-impl From<ragavan_runtime::Error> for Failure {
-    fn from(error: ragavan_runtime::Error) -> Self {
-        Self::Runtime(error)
-    }
-}
-
-impl From<ragavan_shell::Error> for Failure {
-    fn from(error: ragavan_shell::Error) -> Self {
-        Self::Shell(error)
-    }
-}
-
-impl fmt::Display for Failure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Diagnostic for Failure {
+    fn code(&self) -> &'static str {
         match self {
-            Self::CurrentExecutable(source) => {
-                write!(
-                    formatter,
-                    "could not locate the running Ragavan executable: {source}"
-                )
-            }
-            Self::Git(error) => error.fmt(formatter),
-            Self::Adapter(error) => error.fmt(formatter),
-            Self::Runtime(error) => error.fmt(formatter),
-            Self::Shell(error) => error.fmt(formatter),
-            Self::RunCommand { program, source } => write!(
-                formatter,
-                "could not run {}: {source}",
-                std::path::Path::new(program).display()
-            ),
+            Self::CurrentExecutable(_) => "cli.executable.locate",
+            Self::Git(error) => error.code(),
+            Self::Adapter(error) => error.code(),
+            Self::Runtime(error) => error.code(),
+            Self::Shell(error) => error.code(),
+            Self::RunCommand { .. } => "runner.process.start",
+            Self::WriteOutput { .. } => "cli.output.write",
         }
     }
-}
 
-impl std::error::Error for Failure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    fn help(&self) -> Option<String> {
         match self {
-            Self::CurrentExecutable(source) => Some(source),
-            Self::Git(error) => Some(error),
-            Self::Adapter(error) => Some(error),
-            Self::Runtime(error) => Some(error),
-            Self::Shell(error) => Some(error),
-            Self::RunCommand { source, .. } => Some(source),
+            Self::CurrentExecutable(_) => {
+                Some("reinstall Ragavan, then retry from a fresh shell".to_owned())
+            }
+            Self::Git(error) => error.help(),
+            Self::Adapter(error) => error.help(),
+            Self::Runtime(error) => error.help(),
+            Self::Shell(error) => error.help(),
+            Self::RunCommand { .. } => None,
+            Self::WriteOutput { .. } => None,
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::CurrentExecutable(_) => Vec::new(),
+            Self::Git(error) => error.details(),
+            Self::Adapter(error) => error.details(),
+            Self::Runtime(error) => error.details(),
+            Self::Shell(error) => error.details(),
+            Self::RunCommand { program, .. } => vec![Detail::text(
+                "executable",
+                Path::new(program).display().to_string(),
+            )],
+            Self::WriteOutput { output, .. } => vec![Detail::text("output", *output)],
         }
     }
 }
