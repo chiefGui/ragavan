@@ -1,6 +1,8 @@
 use crate::{
-    Adapter, AdapterError, InstallEdit, Selection, UninstallEdit, profile, protocol::RUN_COMMAND,
+    Adapter, AdapterError, InstallEdit, Selection, UninstallEdit, adapter_error, profile,
+    protocol::RUN_COMMAND,
 };
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     fmt,
     fmt::Write as _,
@@ -40,11 +42,15 @@ fn matches(executable: &Path) -> bool {
 }
 
 fn install(_: &Selection) -> Result<InstallEdit, AdapterError> {
-    Ok(Bash::current()?.install()?)
+    Bash::current()
+        .and_then(Bash::install)
+        .map_err(adapter_error)
 }
 
 fn uninstall(_: &Selection) -> Result<UninstallEdit, AdapterError> {
-    Ok(Bash::current()?.uninstall()?)
+    Bash::current()
+        .and_then(Bash::uninstall)
+        .map_err(adapter_error)
 }
 
 fn hook(native_executable: &str, commands: &[&str]) -> String {
@@ -206,6 +212,45 @@ impl std::error::Error for Error {
             Self::InspectProfile { source, .. } => Some(source),
             Self::UpdateProfile(source) => Some(source),
             Self::MissingHome | Self::InvalidHome(_) => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::MissingHome => "shell.bash.home.missing",
+            Self::InvalidHome(_) => "shell.bash.home.invalid",
+            Self::InspectProfile { .. } => "shell.bash.profile.inspect",
+            Self::UpdateProfile(source) => source.code(),
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match self {
+            Self::MissingHome => Some(if cfg!(windows) {
+                "set HOME or USERPROFILE to an absolute home directory".to_owned()
+            } else {
+                "set HOME to an absolute home directory".to_owned()
+            }),
+            Self::InvalidHome(_) => {
+                Some("set the home-directory environment variable to an absolute path".to_owned())
+            }
+            Self::InspectProfile { .. } => None,
+            Self::UpdateProfile(source) => source.help(),
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::MissingHome => Vec::new(),
+            Self::InvalidHome(home) => {
+                vec![Detail::text("home", home.display().to_string())]
+            }
+            Self::InspectProfile { profile, .. } => {
+                vec![Detail::text("profile", profile.display().to_string())]
+            }
+            Self::UpdateProfile(source) => source.details(),
         }
     }
 }

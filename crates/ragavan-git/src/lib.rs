@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use ragavan_core::{Enrollment, IdentityError, WorktreeIdentity};
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     fmt, io,
     path::{Component, Path, PathBuf},
@@ -387,15 +388,15 @@ impl fmt::Display for Error {
                 formatter,
                 "source filename `{file_name}` must contain only letters, numbers, dots, hyphens, or underscores"
             ),
-            Self::InvalidRepositoryId => formatter.write_str(
-                "the Ragavan repository identity is empty; run `ragavan disable` and then `ragavan enable`",
-            ),
+            Self::InvalidRepositoryId => {
+                formatter.write_str("the Ragavan repository identity is empty")
+            }
             Self::InvalidWorktreeId => {
                 formatter.write_str("Git returned an empty worktree identity")
             }
-            Self::MissingRepositoryId => formatter.write_str(
-                "this repository predates worktree isolation; run `ragavan enable` once to finish enrollment",
-            ),
+            Self::MissingRepositoryId => {
+                formatter.write_str("this repository has no Ragavan repository identity")
+            }
             Self::UnexpectedRepositoryLayout {
                 common_dir,
                 git_dir,
@@ -415,6 +416,68 @@ impl std::error::Error for Error {
             Self::StartGit { source, .. } => Some(source),
             Self::NonUtf8GitOutput { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::StartGit { .. } => "git.start",
+            Self::Git { .. } => "git.command",
+            Self::UnexpectedGitOutput { .. } => "git.output.unexpected",
+            Self::NonUtf8GitOutput { .. } => "git.output.non_utf8",
+            Self::InvalidSourceFileName(_) => "git.source_filename.invalid",
+            Self::InvalidRepositoryId => "git.repository_identity.invalid",
+            Self::InvalidWorktreeId => "git.worktree_identity.invalid",
+            Self::MissingRepositoryId => "git.repository_identity.missing",
+            Self::UnexpectedRepositoryLayout { .. } => "git.worktree_layout.unexpected",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match self {
+            Self::InvalidRepositoryId => {
+                Some("run `ragavan disable`, then run `ragavan enable` again".to_owned())
+            }
+            Self::MissingRepositoryId => {
+                Some("run `ragavan enable` once in this repository".to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::StartGit { operation, .. } | Self::NonUtf8GitOutput { operation, .. } => {
+                vec![Detail::text("operation", *operation)]
+            }
+            Self::Git {
+                operation,
+                status,
+                detail,
+            } => vec![
+                Detail::text("operation", *operation),
+                Detail::text("status", status.to_string()),
+                Detail::text("output", detail),
+            ],
+            Self::UnexpectedGitOutput { operation, output } => vec![
+                Detail::text("operation", *operation),
+                Detail::text("output", output),
+            ],
+            Self::InvalidSourceFileName(file_name) => {
+                vec![Detail::text("filename", file_name)]
+            }
+            Self::UnexpectedRepositoryLayout {
+                common_dir,
+                git_dir,
+            } => vec![
+                Detail::text("common_directory", common_dir.display().to_string()),
+                Detail::text("worktree_directory", git_dir.display().to_string()),
+            ],
+            Self::InvalidRepositoryId | Self::InvalidWorktreeId | Self::MissingRepositoryId => {
+                Vec::new()
+            }
         }
     }
 }

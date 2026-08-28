@@ -80,6 +80,7 @@ fn enrollment_requires_a_git_repository() {
     let output = ragavan(directory.path(), &["enable"]);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).starts_with("error[git.command]:"));
     assert!(
         stderr(&output).contains("could not enable Ragavan for the repository"),
         "{output:?}"
@@ -97,6 +98,7 @@ fn missing_git_is_reported() {
         .expect("Ragavan should start");
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).starts_with("error[git.start]:"));
     assert!(
         stderr(&output).contains("could not start Git to read the repository enrollment"),
         "{output:?}"
@@ -109,8 +111,10 @@ fn unknown_commands_are_rejected_before_repository_access() {
     let output = ragavan(directory.path(), &["launch"]);
 
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(stderr(&output).starts_with("error[cli.command.invalid]:"));
     assert!(stderr(&output).contains("unrecognized subcommand 'launch'"));
-    assert!(stderr(&output).contains("Usage: ragavan"));
+    assert!(stderr(&output).contains("help: run `ragavan --help`"));
+    assert!(!stderr(&output).contains('\u{1b}'));
 }
 
 #[test]
@@ -119,6 +123,7 @@ fn unsupported_shells_are_rejected_before_installation() {
     let output = ragavan(directory.path(), &["install", "zsh"]);
 
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(stderr(&output).starts_with("error[cli.value.invalid]:"));
     assert!(stderr(&output).contains("invalid value 'zsh'"));
     assert!(stderr(&output).contains("possible values: bash, powershell"));
 }
@@ -129,6 +134,7 @@ fn automatic_shell_selection_refuses_to_guess() {
     let output = ragavan(directory.path(), &["install"]);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).starts_with("error[shell.unsupported]:"));
     assert!(stderr(&output).contains("could not detect a supported current shell"));
     assert!(stderr(&output).contains("with `bash` or `powershell`"));
 }
@@ -218,7 +224,6 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     assert_eq!(
         json_stdout(&installed),
         serde_json::json!({
-            "schema_version": 2,
             "integration": {
                 "shell": "bash",
                 "state": "installed",
@@ -249,7 +254,6 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     assert_eq!(
         json_stdout(&uninstalled),
         serde_json::json!({
-            "schema_version": 2,
             "integration": {
                 "shell": "bash",
                 "state": "uninstalled",
@@ -274,7 +278,6 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     assert_eq!(
         json_stdout(&repeated),
         serde_json::json!({
-            "schema_version": 2,
             "integration": {
                 "shell": "bash",
                 "state": "already_uninstalled",
@@ -317,7 +320,12 @@ fn powershell_can_be_selected_explicitly() {
         .expect("Ragavan should start");
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stderr(&output).starts_with("error[shell.powershell.unavailable]:"),
+        "{output:?}"
+    );
     assert!(stderr(&output).contains("could not find PowerShell"));
+    assert!(stderr(&output).contains("help: install `pwsh`"));
     assert!(!stderr(&output).contains("Usage: ragavan <COMMAND>"));
 }
 
@@ -336,7 +344,7 @@ fn no_command_prints_help_before_repository_access() {
 }
 
 #[test]
-fn json_reports_enrollment_with_one_versioned_contract() {
+fn json_reports_enrollment_states() {
     let repository = TestRepository::new();
 
     let enabled = ragavan(repository.path(), &["--json", "enable"]);
@@ -344,7 +352,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&enabled), "", "{enabled:?}");
     assert_eq!(
         json_stdout(&enabled),
-        serde_json::json!({"schema_version": 2, "enrollment": "enabled"})
+        serde_json::json!({"enrollment": "enabled"})
     );
 
     let status = ragavan(repository.path(), &["status", "--json"]);
@@ -352,7 +360,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&status), "", "{status:?}");
     assert_eq!(
         json_stdout(&status),
-        serde_json::json!({"schema_version": 2, "enrollment": "enabled"})
+        serde_json::json!({"enrollment": "enabled"})
     );
 
     let disabled = ragavan(repository.path(), &["disable", "--json"]);
@@ -360,33 +368,42 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&disabled), "", "{disabled:?}");
     assert_eq!(
         json_stdout(&disabled),
-        serde_json::json!({"schema_version": 2, "enrollment": "disabled"})
+        serde_json::json!({"enrollment": "disabled"})
     );
 }
 
 #[test]
-fn json_errors_preserve_usage_and_operation_failures() {
+fn json_errors_expose_stable_diagnostics() {
     let directory = TempDirectory::new();
 
     let usage = ragavan(directory.path(), &["--json", "launch"]);
     assert_eq!(usage.status.code(), Some(2), "{usage:?}");
     assert_eq!(stdout(&usage), "", "{usage:?}");
     let usage_error = json_stderr(&usage);
-    assert_eq!(usage_error["schema_version"], 2);
-    assert_eq!(usage_error["error"]["kind"], "usage");
-    assert!(
-        usage_error["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("unrecognized subcommand 'launch'")),
-        "{usage:?}"
+    assert_eq!(usage_error.as_object().map(serde_json::Map::len), Some(1));
+    assert_eq!(usage_error["error"]["code"], "cli.command.invalid");
+    assert_eq!(
+        usage_error["error"]["message"],
+        "unrecognized subcommand 'launch'"
     );
+    assert_eq!(
+        usage_error["error"]["details"]["invalid_subcommand"],
+        "launch"
+    );
+    assert!(usage_error["error"]["help"].is_string());
+    assert_eq!(usage_error["error"]["causes"], serde_json::json!([]));
 
     let operation = ragavan(directory.path(), &["enable", "--json"]);
     assert_eq!(operation.status.code(), Some(1), "{operation:?}");
     assert_eq!(stdout(&operation), "", "{operation:?}");
     let operation_error = json_stderr(&operation);
-    assert_eq!(operation_error["schema_version"], 2);
-    assert_eq!(operation_error["error"]["kind"], "operation");
+    assert_eq!(operation_error["error"]["code"], "git.command");
+    assert_eq!(
+        operation_error["error"]["details"]["operation"],
+        "enable Ragavan for the repository"
+    );
+    assert!(operation_error["error"]["details"]["status"].is_string());
+    assert!(operation_error["error"]["details"]["output"].is_string());
     assert!(
         operation_error["error"]["message"]
             .as_str()
@@ -403,12 +420,45 @@ fn json_errors_preserve_usage_and_operation_failures() {
     assert_eq!(integration.status.code(), Some(1), "{integration:?}");
     assert_eq!(stdout(&integration), "", "{integration:?}");
     let integration_error = json_stderr(&integration);
-    assert_eq!(integration_error["error"]["kind"], "operation");
+    assert_eq!(
+        integration_error["error"]["code"],
+        "shell.powershell.unavailable"
+    );
+    assert!(integration_error["error"]["help"].is_string());
+    let expected_executables = if cfg!(windows) {
+        serde_json::json!(["pwsh.exe", "powershell.exe"])
+    } else {
+        serde_json::json!(["pwsh", "powershell"])
+    };
+    assert_eq!(
+        integration_error["error"]["details"]["executables"],
+        expected_executables
+    );
     assert!(
         integration_error["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("could not find PowerShell")),
         "{integration:?}"
+    );
+
+    let missing_git = Command::new(env!("CARGO_BIN_EXE_ragavan"))
+        .current_dir(directory.path())
+        .args(["status", "--json"])
+        .env("PATH", "")
+        .output()
+        .expect("Ragavan should start");
+    assert_eq!(missing_git.status.code(), Some(1), "{missing_git:?}");
+    let missing_git_error = json_stderr(&missing_git);
+    assert_eq!(missing_git_error["error"]["code"], "git.start");
+    assert_eq!(
+        missing_git_error["error"]["details"]["operation"],
+        "read the repository enrollment"
+    );
+    assert!(
+        missing_git_error["error"]["causes"]
+            .as_array()
+            .is_some_and(|causes| !causes.is_empty()),
+        "{missing_git:?}"
     );
 }
 
@@ -422,11 +472,28 @@ fn json_does_not_replace_shell_protocol_output() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert_eq!(stdout(&output), "", "{output:?}");
     let error = json_stderr(&output);
-    assert_eq!(error["error"]["kind"], "usage");
+    assert_eq!(error["error"]["code"], "cli.output.unsupported");
+    assert!(error["error"]["help"].is_string());
     assert!(
         error["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("unavailable for `hook`")),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn malformed_shell_protocol_is_actionable() {
+    let output = ragavan(TempDirectory::new().path(), &["__run"]);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(stdout(&output), "", "{output:?}");
+    assert!(
+        stderr(&output).starts_with("error[shell.protocol.malformed]:"),
+        "{output:?}"
+    );
+    assert!(
+        stderr(&output).contains("help: run `ragavan install` again"),
         "{output:?}"
     );
 }

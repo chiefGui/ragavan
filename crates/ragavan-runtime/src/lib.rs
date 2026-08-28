@@ -4,6 +4,7 @@ mod assignments;
 
 use self::assignments::PortAssignments;
 use ragavan_core::{Port, ServiceIdentity};
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     env,
     ffi::OsString,
@@ -418,6 +419,92 @@ impl std::error::Error for Error {
             | Self::InvalidAssignments { .. }
             | Self::ResolveLocalhost { .. }
             | Self::NoAvailablePort => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::StateHomeUnavailable { .. } => "runtime.state_home.unavailable",
+            Self::InvalidStateHome { .. } => "runtime.state_home.invalid",
+            Self::CreateState { .. } => "runtime.state.create",
+            Self::OpenLock { .. } => "runtime.lock.open",
+            Self::LockAllocator { .. } => "runtime.lock.allocator",
+            Self::LockService { .. } => "runtime.lock.service",
+            Self::LockPort { .. } => "runtime.lock.port",
+            Self::ServiceAlreadyRunning => "runtime.service.already_running",
+            Self::ReadAssignments { .. } => "runtime.assignments.read",
+            Self::ParseAssignments { .. } => "runtime.assignments.parse",
+            Self::SerializeAssignments { .. } => "runtime.assignments.serialize",
+            Self::InvalidAssignments { .. } => "runtime.assignments.invalid",
+            Self::WriteAssignments { .. } => "runtime.assignments.write",
+            Self::ResolveLocalhost { .. } => "runtime.localhost.resolve",
+            Self::CheckPort { .. } => "runtime.port.check",
+            Self::NoAvailablePort => "runtime.port.unavailable",
+            Self::RunProcess { .. } => "runtime.process.start",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match self {
+            Self::StateHomeUnavailable { variable } => {
+                Some(format!("set {variable} to an absolute local directory"))
+            }
+            Self::InvalidStateHome { variable, .. } => {
+                Some(format!("set {variable} to an absolute path"))
+            }
+            Self::ServiceAlreadyRunning => Some(
+                "stop the existing development process for this service, then retry".to_owned(),
+            ),
+            Self::NoAvailablePort => Some(format!(
+                "free a local port in {}-{} and retry",
+                PORT_RANGE_START,
+                PORT_RANGE_START + PORT_RANGE_SIZE - 1
+            )),
+            _ => None,
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::StateHomeUnavailable { variable } => {
+                vec![Detail::text("variable", *variable)]
+            }
+            Self::InvalidStateHome { variable, path } => vec![
+                Detail::text("variable", *variable),
+                Detail::text("path", path.display().to_string()),
+            ],
+            Self::CreateState { path, .. }
+            | Self::OpenLock { path, .. }
+            | Self::LockAllocator { path, .. }
+            | Self::LockService { path, .. }
+            | Self::LockPort { path, .. }
+            | Self::ReadAssignments { path, .. }
+            | Self::ParseAssignments { path, .. }
+            | Self::SerializeAssignments { path, .. }
+            | Self::WriteAssignments { path, .. } => {
+                vec![Detail::text("path", path.display().to_string())]
+            }
+            Self::InvalidAssignments { path, detail } => vec![
+                Detail::text("path", path.display().to_string()),
+                Detail::text("reason", detail),
+            ],
+            Self::ResolveLocalhost { port } | Self::CheckPort { port, .. } => {
+                vec![Detail::number("port", u64::from(*port))]
+            }
+            Self::NoAvailablePort => vec![
+                Detail::number("range_start", u64::from(PORT_RANGE_START)),
+                Detail::number(
+                    "range_end",
+                    u64::from(PORT_RANGE_START + PORT_RANGE_SIZE - 1),
+                ),
+            ],
+            Self::RunProcess { executable, .. } => vec![Detail::text(
+                "executable",
+                Path::new(executable).display().to_string(),
+            )],
+            Self::ServiceAlreadyRunning => Vec::new(),
         }
     }
 }

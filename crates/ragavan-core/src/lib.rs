@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     fmt,
     path::{Component, Path},
@@ -58,6 +59,25 @@ impl fmt::Display for IdentityError {
 
 impl std::error::Error for IdentityError {}
 
+impl Diagnostic for IdentityError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::EmptyRepository => "identity.repository.empty",
+            Self::EmptyWorktree => "identity.worktree.empty",
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        vec![Detail::text(
+            "identity",
+            match self {
+                Self::EmptyRepository => "repository",
+                Self::EmptyWorktree => "worktree",
+            },
+        )]
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceScope(Option<String>);
 
@@ -113,6 +133,16 @@ impl fmt::Display for ServiceScopeError {
 }
 
 impl std::error::Error for ServiceScopeError {}
+
+impl Diagnostic for ServiceScopeError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::NonRelativePath => "service_scope.non_relative",
+            Self::ParentTraversal => "service_scope.parent_traversal",
+            Self::NonUnicodePath => "service_scope.non_unicode",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceIdentity {

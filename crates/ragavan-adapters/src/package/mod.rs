@@ -3,6 +3,7 @@ mod target;
 pub(super) use target::{PackageSelector, PackageTarget, SelectorBase};
 
 use ragavan_core::{ServiceScope, ServiceScopeError};
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -534,6 +535,118 @@ impl std::error::Error for Error {
             Self::ParsePackage { source, .. } => Some(source),
             Self::InvalidServiceScope { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::MissingTargetValue(_) => "package.target.value_missing",
+            Self::MultipleTargets => "package.target.multiple",
+            Self::NonExactTarget(_) => "package.target.non_exact",
+            Self::CurrentDirectory(_) => "package.current_directory.read",
+            Self::ResolvePath { .. } => "package.path.resolve",
+            Self::CurrentDirectoryOutsideWorktree { .. } => {
+                "package.current_directory.outside_worktree"
+            }
+            Self::PackageOutsideWorktree { .. } => "package.path.outside_worktree",
+            Self::PackageTargetOutsideWorktree { .. } => "package.target.outside_worktree",
+            Self::ResolvePackageTarget { .. } => "package.target.resolve",
+            Self::MissingPackage { .. } => "package.manifest.missing",
+            Self::MissingSelectedPackage { .. } => "package.target.missing",
+            Self::AmbiguousSelectedPackage { .. } => "package.target.ambiguous",
+            Self::DiscoverPackages { source, .. } => source.code(),
+            Self::ReadPackage { .. } => "package.manifest.read",
+            Self::ParsePackage { .. } => "package.manifest.parse",
+            Self::InvalidServiceScope { source, .. } => source.code(),
+            Self::MissingScript { .. } => "package.script.missing",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match self {
+            Self::MissingTargetValue(_)
+            | Self::MultipleTargets
+            | Self::NonExactTarget(_)
+            | Self::MissingSelectedPackage { .. }
+            | Self::AmbiguousSelectedPackage { .. } => {
+                Some("select exactly one package by its name or directory".to_owned())
+            }
+            Self::CurrentDirectoryOutsideWorktree { .. }
+            | Self::PackageOutsideWorktree { .. }
+            | Self::PackageTargetOutsideWorktree { .. } => {
+                Some("run the command for a package inside the enrolled Git worktree".to_owned())
+            }
+            Self::MissingPackage { .. } => Some(
+                "run the command from a package directory or select one workspace package"
+                    .to_owned(),
+            ),
+            Self::DiscoverPackages { source, .. } => source.help(),
+            Self::ParsePackage { .. } => Some("fix the package.json syntax, then retry".to_owned()),
+            Self::InvalidServiceScope { source, .. } => source.help(),
+            Self::MissingScript { name, .. } => Some(format!(
+                "define `scripts.{name}` as a string in package.json"
+            )),
+            Self::CurrentDirectory(_)
+            | Self::ResolvePath { .. }
+            | Self::ResolvePackageTarget { .. }
+            | Self::ReadPackage { .. } => None,
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::MissingTargetValue(option) => vec![Detail::text("option", *option)],
+            Self::NonExactTarget(selector) | Self::AmbiguousSelectedPackage { selector } => {
+                vec![Detail::text(
+                    "selector",
+                    selector.to_string_lossy().into_owned(),
+                )]
+            }
+            Self::CurrentDirectoryOutsideWorktree {
+                current_directory,
+                root,
+            } => vec![
+                Detail::text("current_directory", current_directory.display().to_string()),
+                Detail::text("worktree", root.display().to_string()),
+            ],
+            Self::PackageOutsideWorktree { package, root } => vec![
+                Detail::text("package", package.display().to_string()),
+                Detail::text("worktree", root.display().to_string()),
+            ],
+            Self::PackageTargetOutsideWorktree { selector, root }
+            | Self::MissingSelectedPackage { selector, root } => vec![
+                Detail::text("selector", selector.to_string_lossy().into_owned()),
+                Detail::text("worktree", root.display().to_string()),
+            ],
+            Self::ResolvePackageTarget { selector, .. } => vec![Detail::text(
+                "selector",
+                selector.to_string_lossy().into_owned(),
+            )],
+            Self::MissingPackage { root } => {
+                vec![Detail::text("worktree", root.display().to_string())]
+            }
+            Self::DiscoverPackages { root, source } => {
+                let mut details = vec![Detail::text("worktree", root.display().to_string())];
+                details.extend(source.details());
+                details
+            }
+            Self::ResolvePath { path, .. }
+            | Self::ReadPackage { path, .. }
+            | Self::ParsePackage { path, .. } => {
+                vec![Detail::text("path", path.display().to_string())]
+            }
+            Self::InvalidServiceScope { path, source } => {
+                let mut details = vec![Detail::text("package", path.display().to_string())];
+                details.extend(source.details());
+                details
+            }
+            Self::MissingScript { path, name } => vec![
+                Detail::text("package", path.display().to_string()),
+                Detail::text("script", name),
+            ],
+            Self::MultipleTargets | Self::CurrentDirectory(_) => Vec::new(),
         }
     }
 }

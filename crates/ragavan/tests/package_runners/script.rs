@@ -66,7 +66,9 @@ fn unsupported_shell_syntax_fails_closed() {
         assert_eq!(output.status.code(), Some(1), "{script}: {output:?}");
         let error = stderr(&output);
         assert!(error.contains("unsupported script"), "{script}: {output:?}");
-        assert_eq!(error.lines().count(), 1, "{script}: {output:?}");
+        assert!(error.starts_with("error[script."), "{script}: {output:?}");
+        assert!(error.contains("\n\n  help:"), "{script}: {output:?}");
+        assert!(!error.contains('\u{1b}'), "{script}: {output:?}");
     }
 }
 

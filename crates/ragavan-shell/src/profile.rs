@@ -1,3 +1,4 @@
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     ffi::OsString,
     fmt, fs,
@@ -550,7 +551,7 @@ impl fmt::Display for Error {
             ),
             Self::ProfileChanged { path } => write!(
                 formatter,
-                "could not update {} because it changed while Ragavan was editing it; rerun the command",
+                "could not update {} because it changed while Ragavan was editing it",
                 path.display()
             ),
             Self::WriteProfile { path, source } => {
@@ -579,6 +580,56 @@ impl std::error::Error for Error {
             Self::InvalidProfilePath { .. }
             | Self::MalformedProfile { .. }
             | Self::ProfileChanged { .. } => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidProfilePath { .. } => "shell.profile.path.invalid",
+            Self::ReadProfile { .. } => "shell.profile.read",
+            Self::DecodeProfile { .. } => "shell.profile.encoding.unsupported",
+            Self::MalformedProfile { .. } => "shell.profile.integration.malformed",
+            Self::ProfileChanged { .. } => "shell.profile.changed",
+            Self::WriteProfile { .. } => "shell.profile.write",
+            Self::RollbackFailed { .. } => "shell.profile.rollback",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match self {
+            Self::DecodeProfile { .. } => {
+                Some("save the profile as UTF-8 or UTF-16, then retry".to_owned())
+            }
+            Self::MalformedProfile { .. } => {
+                Some("repair or remove the incomplete Ragavan-managed block, then retry".to_owned())
+            }
+            Self::ProfileChanged { .. } => Some("rerun the command".to_owned()),
+            Self::RollbackFailed { .. } => Some(
+                "review the listed profiles and restore any partially updated files".to_owned(),
+            ),
+            Self::InvalidProfilePath { .. }
+            | Self::ReadProfile { .. }
+            | Self::WriteProfile { .. } => None,
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::InvalidProfilePath { path }
+            | Self::ReadProfile { path, .. }
+            | Self::DecodeProfile { path, .. }
+            | Self::MalformedProfile { path }
+            | Self::ProfileChanged { path }
+            | Self::WriteProfile { path, .. } => {
+                vec![Detail::text("profile", path.display().to_string())]
+            }
+            Self::RollbackFailed { source, rollback } => {
+                let mut details = source.details();
+                details.push(Detail::number("rollback_failures", rollback.len() as u64));
+                details
+            }
         }
     }
 }

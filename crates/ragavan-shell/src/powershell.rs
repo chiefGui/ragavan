@@ -1,6 +1,8 @@
 use crate::{
-    Adapter, AdapterError, InstallEdit, Selection, UninstallEdit, profile, protocol::RUN_COMMAND,
+    Adapter, AdapterError, InstallEdit, Selection, UninstallEdit, adapter_error, profile,
+    protocol::RUN_COMMAND,
 };
+use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
     ffi::OsStr,
     fmt, io,
@@ -63,11 +65,17 @@ fn shell_literal(value: &str) -> String {
 }
 
 fn install(selection: &Selection) -> Result<InstallEdit, AdapterError> {
-    Ok(PowerShell::resolve(selection)?.install()?)
+    PowerShell::resolve(selection)
+        .map_err(adapter_error)?
+        .install()
+        .map_err(adapter_error)
 }
 
 fn uninstall(selection: &Selection) -> Result<UninstallEdit, AdapterError> {
-    Ok(PowerShell::resolve(selection)?.uninstall()?)
+    PowerShell::resolve(selection)
+        .map_err(adapter_error)?
+        .uninstall()
+        .map_err(adapter_error)
 }
 
 struct PowerShell {
@@ -245,9 +253,7 @@ impl fmt::Display for Error {
                 formatter,
                 "could not {operation}: PowerShell returned unexpected output `{output}`"
             ),
-            Self::PowerShellNotFound => formatter.write_str(
-                "could not find PowerShell; install `pwsh` or make `powershell` available on PATH",
-            ),
+            Self::PowerShellNotFound => formatter.write_str("could not find PowerShell"),
         }
     }
 }
@@ -258,6 +264,62 @@ impl std::error::Error for Error {
             Self::StartPowerShell { source, .. } => Some(source),
             Self::NonUtf8PowerShellOutput { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+impl Diagnostic for Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::StartPowerShell { .. } => "shell.powershell.start",
+            Self::PowerShell { .. } => "shell.powershell.command",
+            Self::NonUtf8PowerShellOutput { .. } => "shell.powershell.output.non_utf8",
+            Self::UnexpectedPowerShellOutput { .. } => "shell.powershell.output.unexpected",
+            Self::PowerShellNotFound => "shell.powershell.unavailable",
+        }
+    }
+
+    fn help(&self) -> Option<String> {
+        match self {
+            Self::PowerShellNotFound => {
+                Some("install `pwsh` or make `powershell` available on PATH".to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    fn details(&self) -> Vec<Detail> {
+        match self {
+            Self::StartPowerShell {
+                operation,
+                executable,
+                ..
+            } => vec![
+                Detail::text("operation", *operation),
+                Detail::text("executable", executable.display().to_string()),
+            ],
+            Self::PowerShell {
+                operation,
+                executable,
+                status,
+                detail,
+            } => vec![
+                Detail::text("operation", *operation),
+                Detail::text("executable", executable.display().to_string()),
+                Detail::text("status", status.to_string()),
+                Detail::text("output", detail),
+            ],
+            Self::NonUtf8PowerShellOutput { operation, .. } => {
+                vec![Detail::text("operation", *operation)]
+            }
+            Self::UnexpectedPowerShellOutput { operation, output } => vec![
+                Detail::text("operation", *operation),
+                Detail::text("output", output),
+            ],
+            Self::PowerShellNotFound => vec![Detail::list(
+                "executables",
+                available_executables().iter().copied(),
+            )],
         }
     }
 }
