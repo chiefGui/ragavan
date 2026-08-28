@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ragavan-cli",
  "serde_json",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-adapters"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ragavan-core",
  "ragavan-diagnostics",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -182,18 +182,18 @@ dependencies = [
 
 [[package]]
 name = "ragavan-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ragavan-diagnostics",
 ]
 
 [[package]]
 name = "ragavan-diagnostics"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "ragavan-git"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ragavan-core",
  "ragavan-diagnostics",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-runtime"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ragavan-core",
  "ragavan-diagnostics",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-shell"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ragavan-diagnostics",
 ]
