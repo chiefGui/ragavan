@@ -1,0 +1,261 @@
+name: Release manager
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  RAGAVAN_RELEASE_BRANCH: release-please--branches--main--components--ragavan
+
+concurrency:
+  group: release-manager
+  cancel-in-progress: false
+
+jobs:
+  manage:
+    name: Manage release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Update release pull request or create release
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          target-branch: main
+          token: ${{ github.token }}
+
+      - name: Resolve pending release publisher
+        if: ${{ !cancelled() }}
+        id: publisher
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RAGAVAN_CREATED_TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          tag="${RAGAVAN_CREATED_TAG}"
+          if [[ -z "${tag}" ]]; then
+            version="$(
+              gh api \
+                --header 'Accept: application/vnd.github.raw+json' \
+                "repos/${GH_REPO}/contents/VERSION?ref=main"
+            )"
+            if [[ ! "${version}" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+              echo "The release version on main is invalid." >&2
+              exit 1
+            fi
+            candidate="v${version}"
+            if ! release="$(gh release view "${candidate}" --json isDraft,tagName 2>/dev/null)"; then
+              echo "dispatch=false" >> "${GITHUB_OUTPUT}"
+              echo "tag=" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            if [[ "$(jq -r '.isDraft' <<< "${release}")" != "true" ]]; then
+              echo "dispatch=false" >> "${GITHUB_OUTPUT}"
+              echo "tag=" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            tag="${candidate}"
+          fi
+
+          release="$(gh release view "${tag}" --json isDraft,tagName)"
+          if [[ "$(jq -r '.tagName' <<< "${release}")" != "${tag}" ]]; then
+            echo "GitHub returned the wrong release for '${tag}'." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.isDraft' <<< "${release}")" != "true" ]]; then
+            echo "Release '${tag}' must remain a draft until publication finishes." >&2
+            exit 1
+          fi
+
+          active_runs="$(
+            gh api \
+              --method GET \
+              "repos/${GH_REPO}/actions/workflows/release.yml/runs" \
+              -f "branch=${tag}" \
+              -f 'event=workflow_dispatch' \
+              -f 'per_page=20' \
+              --jq '[.workflow_runs[] | select(.status != "completed")] | length'
+          )"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          if [[ "${active_runs}" -gt 0 ]]; then
+            echo "Publisher for '${tag}' is already active."
+            echo "dispatch=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "dispatch=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Dispatch release publisher
+        if: ${{ !cancelled() && steps.publisher.outputs.dispatch == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RAGAVAN_TAG: ${{ steps.publisher.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh workflow run release.yml \
+            --ref "${RAGAVAN_TAG}" \
+            --field "release_tag=${RAGAVAN_TAG}" \
+            --field "publish=true"
+
+      - name: Locate open release pull request
+        if: ${{ success() && steps.publisher.outputs.tag == '' }}
+        id: release-pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          pull_requests="$(
+            gh pr list \
+              --base main \
+              --head "${RAGAVAN_RELEASE_BRANCH}" \
+              --label 'autorelease: pending' \
+              --limit 2 \
+              --state open \
+              --json headRefName,headRefOid,isCrossRepository,number
+          )"
+          count="$(jq 'length' <<< "${pull_requests}")"
+          if [[ "${count}" -gt 1 ]]; then
+            echo "Expected at most one open Ragavan release pull request." >&2
+            exit 1
+          fi
+          if [[ "${count}" -eq 0 ]]; then
+            echo "found=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          branch="$(jq -r '.[0].headRefName' <<< "${pull_requests}")"
+          head_sha="$(jq -r '.[0].headRefOid' <<< "${pull_requests}")"
+          cross_repository="$(jq -r '.[0].isCrossRepository' <<< "${pull_requests}")"
+          if [[ "${branch}" != "${RAGAVAN_RELEASE_BRANCH}" ||
+            ! "${head_sha}" =~ ^[0-9a-f]{40}$ ||
+            "${cross_repository}" != "false" ]]; then
+            echo "The release pull request has an unexpected source." >&2
+            exit 1
+          fi
+
+          number="$(jq -r '.[0].number' <<< "${pull_requests}")"
+          files="$(
+            gh api \
+              --paginate \
+              "repos/${GH_REPO}/pulls/${number}/files" \
+              --jq '.[].filename'
+          )"
+          while IFS= read -r file; do
+            case "${file}" in
+              .release-please-manifest.json | CHANGELOG.md | Cargo.lock | Cargo.toml | VERSION) ;;
+              *)
+                echo "Release pull request contains unexpected file '${file}'." >&2
+                exit 1
+                ;;
+            esac
+          done <<< "${files}"
+
+          for required_file in .release-please-manifest.json CHANGELOG.md Cargo.toml VERSION; do
+            if ! grep -Fxq -- "${required_file}" <<< "${files}"; then
+              echo "Release pull request is missing '${required_file}'." >&2
+              exit 1
+            fi
+          done
+
+          current_head="$(gh pr view "${number}" --json headRefOid --jq '.headRefOid')"
+          if [[ "${current_head}" != "${head_sha}" ]]; then
+            echo "The release pull request changed while it was being inspected." >&2
+            exit 1
+          fi
+
+          echo "found=true" >> "${GITHUB_OUTPUT}"
+          echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=${head_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out trusted release tooling
+        if: steps.release-pr.outputs.found == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted
+          persist-credentials: false
+          ref: main
+
+      - name: Check out release pull request
+        if: steps.release-pr.outputs.found == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          ref: ${{ steps.release-pr.outputs.head_sha }}
+
+      - name: Install pinned Rust toolchain
+        if: steps.release-pr.outputs.found == 'true'
+        working-directory: trusted
+        run: rustup show
+
+      - name: Install pinned Node.js runtime
+        if: steps.release-pr.outputs.found == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: trusted/.node-version
+
+      - name: Synchronize Cargo release state
+        if: steps.release-pr.outputs.found == 'true'
+        id: cargo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo metadata \
+            --locked \
+            --manifest-path trusted/Cargo.toml \
+            --no-deps \
+            --format-version 1 |
+            node trusted/packaging/release/cargo-lock.mjs candidate
+
+          changed_files="$(git -C candidate diff --name-only)"
+          if [[ -n "${changed_files}" && "${changed_files}" != "Cargo.lock" ]]; then
+            echo "Release synchronization changed unexpected files:" >&2
+            echo "${changed_files}" >&2
+            exit 1
+          fi
+
+          git -C candidate add -- Cargo.lock
+          if git -C candidate diff --cached --quiet; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Commit synchronized Cargo lockfile
+        if: steps.cargo.outputs.changed == 'true'
+        shell: bash
+        env:
+          RAGAVAN_BRANCH: ${{ steps.release-pr.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          git -C candidate config user.name 'github-actions[bot]'
+          git -C candidate config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C candidate commit --message 'chore: synchronize release lockfile'
+          git -C candidate push origin "HEAD:${RAGAVAN_BRANCH}"
+
+      - name: Dispatch release pull request CI
+        if: steps.release-pr.outputs.found == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RAGAVAN_BRANCH: ${{ steps.release-pr.outputs.branch }}
+        run: gh workflow run ci.yml --ref "${RAGAVAN_BRANCH}"

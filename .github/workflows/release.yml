@@ -1,14 +1,15 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
-      bootstrap_npm:
-        description: Publish the first npm release with the temporary bootstrap token
-        required: false
+      release_tag:
+        description: Release tag matching the Cargo version
+        required: true
+        type: string
+      publish:
+        description: Publish npm packages and finalize the GitHub release
+        required: true
         type: boolean
         default: false
 
@@ -16,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event_name }}-${{ github.ref }}
+  group: release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
 env:
@@ -26,6 +27,7 @@ jobs:
   prepare:
     name: Prepare release
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
       tag: ${{ steps.release.outputs.tag }}
@@ -54,32 +56,48 @@ jobs:
       - name: Resolve release identity
         id: release
         shell: bash
+        env:
+          RAGAVAN_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
 
-          version="$(
-            cargo metadata --locked --no-deps --format-version 1 |
-              jq -er '
-                [.packages[] | select(.name == "ragavan") | .version]
-                | if length == 1 then .[0]
-                  else error("expected exactly one Cargo package named ragavan")
-                  end
-              '
-          )"
-          tag="v${version}"
-
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "${tag}" ]]; then
-            echo "Release tag '${GITHUB_REF_NAME}' must match Cargo version '${tag}'." >&2
-            exit 1
-          fi
+          identity="$(node packaging/release/identity.mjs "${RAGAVAN_TAG}")"
+          version="$(jq -er '.version' <<< "${identity}")"
+          tag="$(jq -er '.tag' <<< "${identity}")"
 
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify publication source
+        if: inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RAGAVAN_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "${RAGAVAN_TAG}" ]]; then
+            echo "Published releases must run from tag '${RAGAVAN_TAG}'." >&2
+            exit 1
+          fi
+
+          release="$(gh release view "${RAGAVAN_TAG}" --json isDraft,tagName)"
+          if [[ "$(jq -r '.tagName' <<< "${release}")" != "${RAGAVAN_TAG}" ]]; then
+            echo "GitHub returned the wrong release for '${RAGAVAN_TAG}'." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.isDraft' <<< "${release}")" != "true" ]]; then
+            echo "Release '${RAGAVAN_TAG}' must be a draft before publication." >&2
+            exit 1
+          fi
 
   build:
     name: Build (${{ matrix.target }})
     needs: prepare
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -98,6 +116,12 @@ jobs:
 
       - name: Install release target
         run: rustup target add ${{ matrix.target }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          key: ${{ matrix.target }}
 
       - name: Test release target
         run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
@@ -164,6 +188,7 @@ jobs:
       - prepare
       - build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -220,6 +245,7 @@ jobs:
       - prepare
       - package
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -243,12 +269,13 @@ jobs:
 
   npm-publish:
     name: Publish npm packages
-    if: github.event_name == 'push' || inputs.bootstrap_npm
+    if: inputs.publish
     needs:
       - prepare
       - package
       - npm-smoke
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
@@ -269,44 +296,20 @@ jobs:
           path: target/npm-distribution
 
       - name: Publish npm packages with trusted publishing
-        if: github.event_name == 'push'
         env:
           NPM_CONFIG_USERCONFIG: /dev/null
         run: node packaging/npm/publish.mjs "${{ needs.prepare.outputs.version }}" "target/npm-distribution"
 
-      - name: Publish first npm release with bootstrap token
-        if: github.event_name == 'workflow_dispatch' && inputs.bootstrap_npm
-        shell: bash
-        env:
-          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${NPM_BOOTSTRAP_TOKEN}" ]]; then
-            echo "The NPM_BOOTSTRAP_TOKEN repository secret is required." >&2
-            exit 1
-          fi
-
-          npmrc="${RUNNER_TEMP}/ragavan-npm-bootstrap.npmrc"
-          trap 'rm -f "${npmrc}"' EXIT
-          umask 077
-          printf '//registry.npmjs.org/:_authToken=%s\n' "${NPM_BOOTSTRAP_TOKEN}" > "${npmrc}"
-
-          NPM_CONFIG_PROVENANCE=true \
-            NPM_CONFIG_USERCONFIG="${npmrc}" \
-            node packaging/npm/publish.mjs \
-              '${{ needs.prepare.outputs.version }}' \
-              target/npm-distribution
-
   publish:
-    name: Publish GitHub release
-    if: github.event_name == 'push'
+    name: Finalize GitHub release
+    if: inputs.publish
     needs:
       - prepare
       - package
       - npm-smoke
       - npm-publish
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       artifact-metadata: write
       attestations: write
@@ -340,7 +343,7 @@ jobs:
         with:
           subject-path: target/distribution/*
 
-      - name: Publish GitHub release
+      - name: Finalize GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -349,11 +352,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "${RAGAVAN_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RAGAVAN_TAG}" target/distribution/* --clobber
-          else
-            gh release create "${RAGAVAN_TAG}" target/distribution/* \
-              --verify-tag \
-              --generate-notes \
-              --title "Ragavan ${RAGAVAN_TAG}"
-          fi
+          gh release upload "${RAGAVAN_TAG}" target/distribution/* --clobber
+          gh release edit "${RAGAVAN_TAG}" \
+            --draft=false \
+            --latest \
+            --title "Ragavan ${RAGAVAN_TAG}" \
+            --verify-tag
