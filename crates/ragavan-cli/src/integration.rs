@@ -26,7 +26,7 @@ impl Response for InstallOutcome {
         ))
     }
 
-    fn json_fields(&self) -> Map<String, JsonValue> {
+    fn json_object(&self) -> Map<String, JsonValue> {
         integration_fields(
             self.shell().name(),
             match self {
@@ -63,7 +63,7 @@ impl Response for UninstallOutcome {
         }
     }
 
-    fn json_fields(&self) -> Map<String, JsonValue> {
+    fn json_object(&self) -> Map<String, JsonValue> {
         integration_fields(
             self.shell().name(),
             match self {

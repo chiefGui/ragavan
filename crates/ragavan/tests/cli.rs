@@ -224,7 +224,6 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     assert_eq!(
         json_stdout(&installed),
         serde_json::json!({
-            "schema_version": 3,
             "integration": {
                 "shell": "bash",
                 "state": "installed",
@@ -255,7 +254,6 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     assert_eq!(
         json_stdout(&uninstalled),
         serde_json::json!({
-            "schema_version": 3,
             "integration": {
                 "shell": "bash",
                 "state": "uninstalled",
@@ -280,7 +278,6 @@ fn bash_installation_is_explicit_idempotent_and_reversible() {
     assert_eq!(
         json_stdout(&repeated),
         serde_json::json!({
-            "schema_version": 3,
             "integration": {
                 "shell": "bash",
                 "state": "already_uninstalled",
@@ -347,7 +344,7 @@ fn no_command_prints_help_before_repository_access() {
 }
 
 #[test]
-fn json_reports_enrollment_with_one_versioned_contract() {
+fn json_reports_enrollment_states() {
     let repository = TestRepository::new();
 
     let enabled = ragavan(repository.path(), &["--json", "enable"]);
@@ -355,7 +352,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&enabled), "", "{enabled:?}");
     assert_eq!(
         json_stdout(&enabled),
-        serde_json::json!({"schema_version": 3, "enrollment": "enabled"})
+        serde_json::json!({"enrollment": "enabled"})
     );
 
     let status = ragavan(repository.path(), &["status", "--json"]);
@@ -363,7 +360,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&status), "", "{status:?}");
     assert_eq!(
         json_stdout(&status),
-        serde_json::json!({"schema_version": 3, "enrollment": "enabled"})
+        serde_json::json!({"enrollment": "enabled"})
     );
 
     let disabled = ragavan(repository.path(), &["disable", "--json"]);
@@ -371,7 +368,7 @@ fn json_reports_enrollment_with_one_versioned_contract() {
     assert_eq!(stderr(&disabled), "", "{disabled:?}");
     assert_eq!(
         json_stdout(&disabled),
-        serde_json::json!({"schema_version": 3, "enrollment": "disabled"})
+        serde_json::json!({"enrollment": "disabled"})
     );
 }
 
@@ -383,7 +380,7 @@ fn json_errors_expose_stable_diagnostics() {
     assert_eq!(usage.status.code(), Some(2), "{usage:?}");
     assert_eq!(stdout(&usage), "", "{usage:?}");
     let usage_error = json_stderr(&usage);
-    assert_eq!(usage_error["schema_version"], 3);
+    assert_eq!(usage_error.as_object().map(serde_json::Map::len), Some(1));
     assert_eq!(usage_error["error"]["code"], "cli.command.invalid");
     assert_eq!(
         usage_error["error"]["message"],
@@ -400,7 +397,6 @@ fn json_errors_expose_stable_diagnostics() {
     assert_eq!(operation.status.code(), Some(1), "{operation:?}");
     assert_eq!(stdout(&operation), "", "{operation:?}");
     let operation_error = json_stderr(&operation);
-    assert_eq!(operation_error["schema_version"], 3);
     assert_eq!(operation_error["error"]["code"], "git.command");
     assert_eq!(
         operation_error["error"]["details"]["operation"],
@@ -476,7 +472,6 @@ fn json_does_not_replace_shell_protocol_output() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert_eq!(stdout(&output), "", "{output:?}");
     let error = json_stderr(&output);
-    assert_eq!(error["schema_version"], 3);
     assert_eq!(error["error"]["code"], "cli.output.unsupported");
     assert!(error["error"]["help"].is_string());
     assert!(

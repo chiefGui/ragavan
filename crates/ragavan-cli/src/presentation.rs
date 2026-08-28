@@ -4,7 +4,6 @@ use ragavan_diagnostics::{Diagnostic, Value};
 use serde_json::{Map, Value as JsonValue, json};
 use std::{fmt, io, io::Write as _};
 
-const JSON_SCHEMA_VERSION: u8 = 3;
 const ERROR_STYLE: Style = AnsiColor::Red.on_default().effects(Effects::BOLD);
 const SUCCESS_STYLE: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
 const CODE_STYLE: Style = AnsiColor::Cyan.on_default();
@@ -26,7 +25,7 @@ pub(super) enum Format {
 pub(super) trait Response {
     fn write_human(&self, output: &mut HumanOutput<'_>) -> io::Result<()>;
 
-    fn json_fields(&self) -> Map<String, JsonValue>;
+    fn json_object(&self) -> Map<String, JsonValue>;
 }
 
 pub(super) struct HumanOutput<'a> {
@@ -69,14 +68,11 @@ pub(super) fn present(response: &impl Response, format: Format) -> io::Result<()
             let mut writer = anstream::stdout().lock();
             response.write_human(&mut HumanOutput::new(&mut writer))
         }
-        Format::Json => {
-            let mut fields = response.json_fields();
-            fields.insert(
-                "schema_version".to_owned(),
-                JsonValue::from(JSON_SCHEMA_VERSION),
-            );
-            writeln!(anstream::stdout().lock(), "{}", JsonValue::Object(fields))
-        }
+        Format::Json => writeln!(
+            anstream::stdout().lock(),
+            "{}",
+            JsonValue::Object(response.json_object())
+        ),
     };
     ignore_broken_pipe(result)
 }
@@ -140,7 +136,6 @@ fn diagnostic_json(error: &dyn Diagnostic) -> JsonValue {
     }
 
     json!({
-        "schema_version": JSON_SCHEMA_VERSION,
         "error": {
             "code": error.code(),
             "message": root_message,

@@ -14,7 +14,7 @@ impl Response for Enrollment {
         ))
     }
 
-    fn json_fields(&self) -> Map<String, JsonValue> {
+    fn json_object(&self) -> Map<String, JsonValue> {
         let state = match self {
             Self::Enabled => "enabled",
             Self::Disabled => "disabled",
