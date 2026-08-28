@@ -9,7 +9,8 @@ on:
 permissions: {}
 
 env:
-  RAGAVAN_RELEASE_BRANCH: release-please--branches--main--components--ragavan
+  RAGAVAN_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+  RAGAVAN_RELEASE_BRANCH: release-please--branches--${{ github.event.repository.default_branch }}--components--ragavan
 
 concurrency:
   group: release-manager
@@ -30,7 +31,7 @@ jobs:
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          target-branch: main
+          target-branch: ${{ env.RAGAVAN_DEFAULT_BRANCH }}
           token: ${{ github.token }}
 
       - name: Resolve pending release publisher
@@ -49,10 +50,10 @@ jobs:
             version="$(
               gh api \
                 --header 'Accept: application/vnd.github.raw+json' \
-                "repos/${GH_REPO}/contents/VERSION?ref=main"
+                "repos/${GH_REPO}/contents/VERSION?ref=${RAGAVAN_DEFAULT_BRANCH}"
             )"
             if [[ ! "${version}" =~ ^[0-9A-Za-z.+-]+$ ]]; then
-              echo "The release version on main is invalid." >&2
+              echo "The release version on the default branch is invalid." >&2
               exit 1
             fi
             candidate="v${version}"
@@ -83,7 +84,7 @@ jobs:
             gh api \
               --method GET \
               "repos/${GH_REPO}/actions/workflows/release.yml/runs" \
-              -f "branch=${tag}" \
+              -f "branch=${RAGAVAN_DEFAULT_BRANCH}" \
               -f 'event=workflow_dispatch' \
               -f 'per_page=20' \
               --jq '[.workflow_runs[] | select(.status != "completed")] | length'
@@ -107,7 +108,7 @@ jobs:
           set -euo pipefail
 
           gh workflow run release.yml \
-            --ref "${RAGAVAN_TAG}" \
+            --ref "${RAGAVAN_DEFAULT_BRANCH}" \
             --field "release_tag=${RAGAVAN_TAG}" \
             --field "publish=true"
 
@@ -123,7 +124,7 @@ jobs:
 
           pull_requests="$(
             gh pr list \
-              --base main \
+              --base "${RAGAVAN_DEFAULT_BRANCH}" \
               --head "${RAGAVAN_RELEASE_BRANCH}" \
               --label 'autorelease: pending' \
               --limit 2 \
@@ -190,7 +191,7 @@ jobs:
         with:
           path: trusted
           persist-credentials: false
-          ref: main
+          ref: ${{ env.RAGAVAN_DEFAULT_BRANCH }}
 
       - name: Check out release pull request
         if: steps.release-pr.outputs.found == 'true'
