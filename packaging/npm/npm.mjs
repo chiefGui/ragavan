@@ -4,6 +4,23 @@ import path from "node:path";
 
 let invocation;
 
+export function parseNpmReport(output, meaning) {
+  let value;
+  try {
+    value = JSON.parse(output);
+  } catch (error) {
+    throw new Error(`npm returned invalid ${meaning} metadata`, {
+      cause: error,
+    });
+  }
+
+  const reports = Array.isArray(value) ? value : [value];
+  if (reports.length !== 1 || !reports[0] || typeof reports[0] !== "object") {
+    throw new Error(`npm returned unexpected ${meaning} metadata`);
+  }
+  return reports[0];
+}
+
 function resolveInvocation() {
   if (invocation) {
     return invocation;
@@ -50,10 +67,11 @@ function resolveInvocation() {
 
 export function runNpm(arguments_, options = {}) {
   const npm = resolveInvocation();
+  const inherit = options.stdio === "inherit";
   const result = spawnSync(npm.command, [...npm.arguments, ...arguments_], {
     cwd: options.cwd,
-    encoding: "utf8",
     env: options.env ?? process.env,
+    ...(inherit ? { stdio: "inherit" } : { encoding: "utf8" }),
     windowsHide: true,
   });
 
@@ -63,11 +81,15 @@ export function runNpm(arguments_, options = {}) {
     });
   }
   if (result.status !== 0) {
-    const detail = result.stderr.trim() || result.stdout.trim();
+    const stderr =
+      typeof result.stderr === "string" ? result.stderr.trim() : "";
+    const stdout =
+      typeof result.stdout === "string" ? result.stdout.trim() : "";
+    const detail = stderr || stdout;
     throw new Error(
       `npm ${arguments_[0] ?? "command"} failed with exit code ${result.status}${detail ? `: ${detail}` : ""}`,
     );
   }
 
-  return result.stdout;
+  return typeof result.stdout === "string" ? result.stdout : "";
 }

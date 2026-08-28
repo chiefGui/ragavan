@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
+  appendFile,
   chmod,
   copyFile,
   lstat,
@@ -20,8 +21,15 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { npmPlatforms, readPlatforms } from "../platforms.mjs";
+import {
+  PUBLICATION_MANIFEST,
+  PUBLICATION_SCHEMA,
+  ROOT_PACKAGE,
+  tarballName,
+} from "./family.mjs";
 import { runNpm } from "./npm.mjs";
 import { packageFamily } from "./package.mjs";
+import { loadPublication } from "./publish.mjs";
 
 const platforms = npmPlatforms(await readPlatforms());
 const smokeExecutable = fileURLToPath(new URL("./smoke.mjs", import.meta.url));
@@ -122,21 +130,59 @@ test("packages and globally installs the complete npm family", async (context) =
 
   const tarballs = await packageFamily(version, input, output);
   const expectedNames = [
-    ...platforms.map((platform) => `${platform.package}-${version}.tgz`),
-    `ragavan-${version}.tgz`,
+    ...platforms.map((platform) => tarballName(platform.package, version)),
+    tarballName(ROOT_PACKAGE, version),
   ].sort();
   assert.deepEqual(
     tarballs.map((tarball) => path.basename(tarball)).sort(),
     expectedNames,
   );
-  assert.deepEqual((await readdir(output)).sort(), expectedNames);
+  assert.deepEqual(
+    (await readdir(output)).sort(),
+    [...expectedNames, PUBLICATION_MANIFEST].sort(),
+  );
+  const publication = JSON.parse(
+    await readFile(path.join(output, PUBLICATION_MANIFEST), "utf8"),
+  );
+  assert.equal(publication.schema, PUBLICATION_SCHEMA);
+  assert.equal(publication.version, version);
+  assert.deepEqual(
+    publication.packages.map(({ kind, name, target, tarball }) => ({
+      kind,
+      name,
+      ...(target ? { target } : {}),
+      tarball,
+    })),
+    [
+      ...platforms.map((platform) => ({
+        kind: "native",
+        name: platform.package,
+        target: platform.target,
+        tarball: tarballName(platform.package, version),
+      })),
+      {
+        kind: "launcher",
+        name: ROOT_PACKAGE,
+        tarball: tarballName(ROOT_PACKAGE, version),
+      },
+    ],
+  );
+  for (const releasePackage of publication.packages) {
+    assert.match(releasePackage.integrity, /^sha512-/);
+  }
+  const loadedPublication = await loadPublication(version, output);
+  assert.equal(loadedPublication.tag, "next");
+  assert.deepEqual(
+    loadedPublication.packages.map(({ kind, name }) => ({ kind, name })),
+    publication.packages.map(({ kind, name }) => ({ kind, name })),
+  );
 
   const currentPlatform = hostPlatform();
 
-  const rootTarball = path.join(output, `ragavan-${version}.tgz`);
+  const rootTarball = path.join(output, tarballName(ROOT_PACKAGE, version));
   const platformTarball = path.join(
     output,
-    `${currentPlatform.package}-${version}.tgz`,
+    tarballName(currentPlatform.package, version),
   );
   const environment = npmEnvironment(cache);
   runNpm(
@@ -236,6 +282,14 @@ test("packages and globally installs the complete npm family", async (context) =
     missingResult.stderr,
     new RegExp(`native package ${currentPlatform.package} is missing`),
   );
+
+  await appendFile(rootTarball, "tampered", "utf8");
+  await assert.rejects(
+    loadPublication(version, output),
+    new RegExp(
+      `npm tarball integrity does not match for ${ROOT_PACKAGE}@${version}`,
+    ),
+  );
 });
 
 test("rejects incomplete inputs without leaving partial output", async (context) => {
@@ -332,9 +386,13 @@ test("smoke install refuses an existing prefix", async (context) => {
   const sentinel = path.join(prefix, "sentinel");
   const platform = hostPlatform();
   await mkdir(artifacts);
-  await writeFile(path.join(artifacts, `ragavan-${version}.tgz`), "", "utf8");
   await writeFile(
-    path.join(artifacts, `${platform.package}-${version}.tgz`),
+    path.join(artifacts, tarballName(ROOT_PACKAGE, version)),
+    "",
+    "utf8",
+  );
+  await writeFile(
+    path.join(artifacts, tarballName(platform.package, version)),
     "",
     "utf8",
   );

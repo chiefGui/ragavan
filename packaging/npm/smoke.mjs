@@ -1,48 +1,10 @@
 import { spawnSync } from "node:child_process";
-import { lstat, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { npmPlatforms, readPlatforms } from "../platforms.mjs";
+import { ROOT_PACKAGE, requireVersion, tarballName } from "./family.mjs";
+import { requireAbsent, requireDirectory, requireFile } from "./filesystem.mjs";
 import { runNpm } from "./npm.mjs";
-
-const VERSION_PATTERN = /^[0-9A-Za-z.+-]+$/;
-
-async function pathType(filePath) {
-  try {
-    return await stat(filePath);
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
-async function requireFile(filePath, meaning) {
-  const metadata = await pathType(filePath);
-  if (!metadata || !metadata.isFile()) {
-    throw new Error(`${meaning} was not found at ${filePath}`);
-  }
-}
-
-async function requireDirectory(directory, meaning) {
-  const metadata = await pathType(directory);
-  if (!metadata || !metadata.isDirectory()) {
-    throw new Error(`${meaning} was not found at ${directory}`);
-  }
-}
-
-async function requireAbsent(filePath, meaning) {
-  try {
-    await lstat(filePath);
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-  throw new Error(`${meaning} already exists at ${filePath}`);
-}
 
 function runInstalledCommand(executable) {
   const options = {
@@ -70,9 +32,7 @@ function runInstalledCommand(executable) {
 }
 
 async function smoke(version, target, artifacts, prefix) {
-  if (!VERSION_PATTERN.test(version)) {
-    throw new Error(`invalid npm package version ${version}`);
-  }
+  requireVersion(version);
   if (artifacts.length === 0) {
     throw new Error("npm artifact directory cannot be empty");
   }
@@ -94,10 +54,13 @@ async function smoke(version, target, artifacts, prefix) {
 
   const artifactDirectory = path.resolve(artifacts);
   const installationPrefix = path.resolve(prefix);
-  const rootTarball = path.join(artifactDirectory, `ragavan-${version}.tgz`);
+  const rootTarball = path.join(
+    artifactDirectory,
+    tarballName(ROOT_PACKAGE, version),
+  );
   const platformTarball = path.join(
     artifactDirectory,
-    `${platform.package}-${version}.tgz`,
+    tarballName(platform.package, version),
   );
   await requireDirectory(artifactDirectory, "npm artifact directory");
   await requireFile(rootTarball, "root npm package");

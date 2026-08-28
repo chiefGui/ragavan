@@ -5,6 +5,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      bootstrap_npm:
+        description: Publish the first npm release with the temporary bootstrap token
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -203,7 +209,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-${{ needs.prepare.outputs.version }}
-          path: target/npm-distribution/*.tgz
+          path: target/npm-distribution/*
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -235,13 +241,71 @@ jobs:
       - name: Install and run npm package
         run: node packaging/npm/smoke.mjs "${{ needs.prepare.outputs.version }}" "${{ matrix.target }}" "target/npm-distribution" "${{ runner.temp }}/ragavan-npm-smoke"
 
+  npm-publish:
+    name: Publish npm packages
+    if: github.event_name == 'push' || inputs.bootstrap_npm
+    needs:
+      - prepare
+      - package
+      - npm-smoke
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Node.js runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Download npm artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-${{ needs.prepare.outputs.version }}
+          path: target/npm-distribution
+
+      - name: Publish npm packages with trusted publishing
+        if: github.event_name == 'push'
+        env:
+          NPM_CONFIG_USERCONFIG: /dev/null
+        run: node packaging/npm/publish.mjs "${{ needs.prepare.outputs.version }}" "target/npm-distribution"
+
+      - name: Publish first npm release with bootstrap token
+        if: github.event_name == 'workflow_dispatch' && inputs.bootstrap_npm
+        shell: bash
+        env:
+          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NPM_BOOTSTRAP_TOKEN}" ]]; then
+            echo "The NPM_BOOTSTRAP_TOKEN repository secret is required." >&2
+            exit 1
+          fi
+
+          npmrc="${RUNNER_TEMP}/ragavan-npm-bootstrap.npmrc"
+          trap 'rm -f "${npmrc}"' EXIT
+          umask 077
+          printf '//registry.npmjs.org/:_authToken=%s\n' "${NPM_BOOTSTRAP_TOKEN}" > "${npmrc}"
+
+          NPM_CONFIG_PROVENANCE=true \
+            NPM_CONFIG_USERCONFIG="${npmrc}" \
+            node packaging/npm/publish.mjs \
+              '${{ needs.prepare.outputs.version }}' \
+              target/npm-distribution
+
   publish:
-    name: Publish release
+    name: Publish GitHub release
     if: github.event_name == 'push'
     needs:
       - prepare
       - package
       - npm-smoke
+      - npm-publish
     runs-on: ubuntu-24.04
     permissions:
       artifact-metadata: write

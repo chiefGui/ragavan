@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ragavan-cli",
  "serde_json",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-adapters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ragavan-core",
  "ragavan-git",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "ragavan-adapters",
@@ -114,18 +114,18 @@ dependencies = [
 
 [[package]]
 name = "ragavan-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ragavan-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ragavan-core",
 ]
 
 [[package]]
 name = "ragavan-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ragavan-core",
  "serde_json",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-shell"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "serde"
