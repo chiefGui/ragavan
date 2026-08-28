@@ -2,13 +2,15 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isMain } from "./entrypoint.mjs";
+
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const platformCatalog = path.join(sourceDirectory, "platforms.json");
 
 const TARGET_PATTERN = /^[0-9A-Za-z._-]+$/;
 const RUNNER_PATTERN = /^[0-9A-Za-z._-]+$/;
 const RUNTIME_PATTERN = /^[a-z0-9_]+$/;
-const PACKAGE_PATTERN = /^ragavan(?:-[a-z0-9]+)+$/;
+const PACKAGE_PATTERN = /^@[a-z0-9]+(?:-[a-z0-9]+)*\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 function requireObject(value, meaning) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -131,8 +133,7 @@ function releaseMatrix(platforms) {
   };
 }
 
-const invokedPath = process.argv[1] && path.resolve(process.argv[1]);
-if (invokedPath === fileURLToPath(import.meta.url)) {
+if (isMain(import.meta.url)) {
   if (process.argv.length !== 2) {
     process.stderr.write("usage: platforms.mjs\n");
     process.exitCode = 2;

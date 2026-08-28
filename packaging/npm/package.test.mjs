@@ -10,6 +10,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   stat,
   symlink,
@@ -34,6 +35,17 @@ import { loadPublication } from "./publish.mjs";
 const platforms = npmPlatforms(await readPlatforms());
 const smokeExecutable = fileURLToPath(new URL("./smoke.mjs", import.meta.url));
 const version = "9.8.7-test.4";
+
+test("maps only project-owned native packages to npm tarballs", () => {
+  assert.equal(
+    tarballName("@ragavan-cli/win32-x64-msvc", version),
+    `ragavan-cli-win32-x64-msvc-${version}.tgz`,
+  );
+  assert.throws(
+    () => tarballName("@another-project/win32-x64-msvc", version),
+    /invalid Ragavan npm package/,
+  );
+});
 
 async function temporaryDirectory(testContext) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "ragavan-npm-test-"));
@@ -228,10 +240,14 @@ test("packages and globally installs the complete npm family", async (context) =
       binary,
     })),
   );
+  const [nativeScope, nativePackage] = currentPlatform.package.split("/");
   assert.deepEqual(
     (await readdir(globalRoot)).sort(),
-    ["ragavan", currentPlatform.package].sort(),
+    ["ragavan", nativeScope].sort(),
   );
+  assert.deepEqual(await readdir(path.join(globalRoot, nativeScope)), [
+    nativePackage,
+  ]);
 
   const platformPackage = JSON.parse(
     await readFile(
@@ -262,8 +278,8 @@ test("packages and globally installs the complete npm family", async (context) =
   ]);
   assert.equal(identityResult.status, 0, identityResult.stderr);
   assert.equal(
-    path.normalize(identityResult.stdout),
-    path.normalize(nativeExecutable),
+    await realpath(identityResult.stdout),
+    await realpath(nativeExecutable),
   );
 
   const exitResult = executeLauncher(launcher.source, [

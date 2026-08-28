@@ -10,6 +10,7 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isMain } from "../entrypoint.mjs";
 import { npmPlatforms, readPlatforms } from "../platforms.mjs";
 import {
   PUBLICATION_MANIFEST,
@@ -296,8 +297,7 @@ export async function packageFamily(version, input, output) {
   }
 }
 
-const invokedPath = process.argv[1] && path.resolve(process.argv[1]);
-if (invokedPath === fileURLToPath(import.meta.url)) {
+if (isMain(import.meta.url)) {
   const arguments_ = process.argv.slice(2);
   if (arguments_.length !== 3) {
     process.stderr.write(

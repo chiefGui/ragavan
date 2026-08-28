@@ -6,7 +6,7 @@
     "npm": {
       "os": "win32",
       "cpu": "x64",
-      "package": "ragavan-win32-x64-msvc"
+      "package": "@ragavan-cli/win32-x64-msvc"
     }
   },
   {
@@ -16,7 +16,7 @@
     "npm": {
       "os": "linux",
       "cpu": "x64",
-      "package": "ragavan-linux-x64-musl"
+      "package": "@ragavan-cli/linux-x64-musl"
     }
   },
   {
@@ -26,7 +26,7 @@
     "npm": {
       "os": "darwin",
       "cpu": "x64",
-      "package": "ragavan-darwin-x64"
+      "package": "@ragavan-cli/darwin-x64"
     }
   },
   {
@@ -36,7 +36,7 @@
     "npm": {
       "os": "darwin",
       "cpu": "arm64",
-      "package": "ragavan-darwin-arm64"
+      "package": "@ragavan-cli/darwin-arm64"
     }
   }
 ]
