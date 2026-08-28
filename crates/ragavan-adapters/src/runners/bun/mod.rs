@@ -17,7 +17,7 @@ fn recognize(arguments: &[OsString]) -> Option<DevelopmentCommand<'_>> {
     Some(DevelopmentCommand::new(
         "bun dev",
         "dev",
-        PackageTarget::CurrentDirectory,
+        PackageTarget::WorkingDirectory,
         script_arguments,
         deliver_directly,
     ))

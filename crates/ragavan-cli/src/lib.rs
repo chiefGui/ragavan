@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod dashboard;
 mod enrollment;
 mod integration;
 mod presentation;
@@ -10,15 +11,9 @@ use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use presentation::Format;
-use ragavan_core::{LaunchPlan, ServiceIdentity};
+use ragavan_application::DashboardScope;
 use ragavan_diagnostics::{Detail, Diagnostic};
-use std::{
-    env,
-    ffi::OsString,
-    io,
-    path::Path,
-    process::{Command as ProcessCommand, ExitStatus},
-};
+use std::{env, ffi::OsString, io, path::PathBuf, process::ExitStatus};
 use thiserror::Error;
 
 /// Run Ragavan's command-line interface and return its process status code.
@@ -66,9 +61,35 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
             ragavan_shell::uninstall(shell_target(shell)).map_err(Failure::from),
             format,
         ),
-        Command::Enable => complete(ragavan_git::enable().map_err(Failure::from), format),
-        Command::Status => complete(ragavan_git::status().map_err(Failure::from), format),
-        Command::Disable => complete(ragavan_git::disable().map_err(Failure::from), format),
+        Command::Enable => complete(
+            current_directory().and_then(|directory| {
+                ragavan_application::enable_repository(&directory).map_err(Failure::from)
+            }),
+            format,
+        ),
+        Command::Status => complete(
+            current_directory().and_then(|directory| {
+                ragavan_application::repository_status(&directory).map_err(Failure::from)
+            }),
+            format,
+        ),
+        Command::Disable => complete(
+            current_directory().and_then(|directory| {
+                ragavan_application::disable_repository(&directory).map_err(Failure::from)
+            }),
+            format,
+        ),
+        Command::Dashboard { current } => {
+            let dashboard = if current {
+                current_directory().and_then(|directory| {
+                    ragavan_application::dashboard(DashboardScope::Repository(&directory))
+                        .map_err(Failure::from)
+                })
+            } else {
+                ragavan_application::dashboard(DashboardScope::All).map_err(Failure::from)
+            };
+            complete(dashboard, format)
+        }
         Command::Hook { shell } => {
             if format == Format::Json {
                 return report_usage(
@@ -84,11 +105,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
                     return report_failure(Failure::CurrentExecutable(source), format);
                 }
             };
-            let hook = match ragavan_shell::hook(
-                shell,
-                &native_executable,
-                ragavan_adapters::commands(),
-            ) {
+            let hook = match ragavan_application::shell_hook(shell, &native_executable) {
                 Ok(hook) => hook,
                 Err(error) => return report_failure(Failure::from(error), format),
             };
@@ -145,6 +162,12 @@ enum Command {
     Status,
     /// Disable Ragavan for the current repository.
     Disable,
+    /// Show known repositories and development services.
+    Dashboard {
+        /// Show only the repository containing the current directory.
+        #[arg(long)]
+        current: bool,
+    },
     /// Print shell integration.
     Hook {
         #[arg(value_parser = shell_parser())]
@@ -334,47 +357,24 @@ fn clap_error_details(error: &clap::Error) -> Vec<Detail> {
 }
 
 fn run_command(request: ragavan_shell::protocol::RunRequest<'_>) -> i32 {
-    match execute_command(&request) {
+    let result = current_directory().and_then(|directory| {
+        ragavan_application::run_intercepted_command(
+            &directory,
+            request.program(),
+            request.launch_arguments(),
+            request.command(),
+            request.arguments(),
+        )
+        .map_err(Failure::from)
+    });
+    match result {
         Ok(status) => child_exit_code(status),
         Err(error) => presentation::report(&error, Format::Human, 1),
     }
 }
 
-fn execute_command(
-    request: &ragavan_shell::protocol::RunRequest<'_>,
-) -> Result<ExitStatus, Failure> {
-    let mut command = ProcessCommand::new(request.program());
-    command
-        .args(request.launch_arguments())
-        .args(request.arguments());
-    let Some((lease, plan)) = isolate_command(request.command(), request.arguments())? else {
-        return command.status().map_err(|source| Failure::RunCommand {
-            program: request.program().to_owned(),
-            source,
-        });
-    };
-
-    command.args(plan.into_additional_arguments());
-    lease.run(&mut command).map_err(Failure::from)
-}
-
-fn isolate_command(
-    command: &std::ffi::OsStr,
-    arguments: &[OsString],
-) -> Result<Option<(ragavan_runtime::PortLease, LaunchPlan)>, Failure> {
-    let Some(development_command) = ragavan_adapters::development_command(command, arguments)
-    else {
-        return Ok(None);
-    };
-    let Some(worktree) = ragavan_git::enrolled_worktree()? else {
-        return Ok(None);
-    };
-    let isolation = development_command.resolve(worktree.root())?;
-    let identity = ServiceIdentity::new(worktree.identity()?, isolation.service_scope().clone());
-    let lease = ragavan_runtime::acquire_port(&identity)?;
-    let plan = isolation.launch_plan(lease.port());
-
-    Ok(Some((lease, plan)))
+fn current_directory() -> Result<PathBuf, Failure> {
+    env::current_dir().map_err(Failure::CurrentDirectory)
 }
 
 fn child_exit_code(status: ExitStatus) -> i32 {
@@ -397,20 +397,12 @@ fn child_exit_code(status: ExitStatus) -> i32 {
 enum Failure {
     #[error("could not locate the running Ragavan executable: {0}")]
     CurrentExecutable(#[source] io::Error),
+    #[error("could not locate the current directory: {0}")]
+    CurrentDirectory(#[source] io::Error),
     #[error(transparent)]
-    Git(#[from] ragavan_git::Error),
-    #[error(transparent)]
-    Adapter(#[from] ragavan_adapters::Error),
-    #[error(transparent)]
-    Runtime(#[from] ragavan_runtime::Error),
+    Application(#[from] ragavan_application::Error),
     #[error(transparent)]
     Shell(#[from] ragavan_shell::Error),
-    #[error("could not run {}: {source}", Path::new(.program).display())]
-    RunCommand {
-        program: OsString,
-        #[source]
-        source: io::Error,
-    },
     #[error("could not write {output}: {source}")]
     WriteOutput {
         output: &'static str,
@@ -423,11 +415,9 @@ impl Diagnostic for Failure {
     fn code(&self) -> &'static str {
         match self {
             Self::CurrentExecutable(_) => "cli.executable.locate",
-            Self::Git(error) => error.code(),
-            Self::Adapter(error) => error.code(),
-            Self::Runtime(error) => error.code(),
+            Self::CurrentDirectory(_) => "cli.directory.locate",
+            Self::Application(error) => error.code(),
             Self::Shell(error) => error.code(),
-            Self::RunCommand { .. } => "runner.process.start",
             Self::WriteOutput { .. } => "cli.output.write",
         }
     }
@@ -437,11 +427,9 @@ impl Diagnostic for Failure {
             Self::CurrentExecutable(_) => {
                 Some("reinstall Ragavan, then retry from a fresh shell".to_owned())
             }
-            Self::Git(error) => error.help(),
-            Self::Adapter(error) => error.help(),
-            Self::Runtime(error) => error.help(),
+            Self::CurrentDirectory(_) => None,
+            Self::Application(error) => error.help(),
             Self::Shell(error) => error.help(),
-            Self::RunCommand { .. } => None,
             Self::WriteOutput { .. } => None,
         }
     }
@@ -449,14 +437,9 @@ impl Diagnostic for Failure {
     fn details(&self) -> Vec<Detail> {
         match self {
             Self::CurrentExecutable(_) => Vec::new(),
-            Self::Git(error) => error.details(),
-            Self::Adapter(error) => error.details(),
-            Self::Runtime(error) => error.details(),
+            Self::CurrentDirectory(_) => Vec::new(),
+            Self::Application(error) => error.details(),
             Self::Shell(error) => error.details(),
-            Self::RunCommand { program, .. } => vec![Detail::text(
-                "executable",
-                Path::new(program).display().to_string(),
-            )],
             Self::WriteOutput { output, .. } => vec![Detail::text("output", *output)],
         }
     }

@@ -8,6 +8,51 @@ use crate::support::{
 use std::{fs, path::PathBuf};
 
 #[test]
+fn dashboard_reports_active_and_inactive_service_leases() {
+    let repository = TestRepository::new();
+    fs::write(
+        repository.path().join("package.json"),
+        r#"{"scripts":{"dev":"vite"}}"#,
+    )
+    .expect("package should be written");
+    assert_stdout(git(repository.path(), &["add", "package.json"]), "");
+    assert_success(&git(repository.path(), &["commit", "-m", "add package"]));
+    assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
+    let bun = FakeCommand::waiting("bun");
+    let (process, port) = start_package_runner(repository.path(), "bun", bun.path(), &["dev"]);
+
+    let active = ragavan(repository.path(), &["dashboard", "--current", "--json"]);
+    assert_success(&active);
+    assert_eq!(stderr(&active), "", "{active:?}");
+    let active = serde_json::from_slice::<serde_json::Value>(&active.stdout)
+        .expect("active dashboard should be JSON");
+    let service = &active["repositories"][0]["worktrees"][0]["services"][0];
+    assert_eq!(service["port"], port);
+    assert_eq!(service["lease"], "active");
+
+    stop_runner(process);
+    let inactive = ragavan(repository.path(), &["dashboard", "--current", "--json"]);
+    assert_success(&inactive);
+    let inactive = serde_json::from_slice::<serde_json::Value>(&inactive.stdout)
+        .expect("inactive dashboard should be JSON");
+    assert_eq!(
+        inactive["repositories"][0]["worktrees"][0]["services"][0]["lease"],
+        "inactive"
+    );
+
+    assert_success(&ragavan(repository.path(), &["disable"]));
+    let unregistered = ragavan(repository.path(), &["dashboard", "--json"]);
+    assert_success(&unregistered);
+    let unregistered = serde_json::from_slice::<serde_json::Value>(&unregistered.stdout)
+        .expect("unregistered dashboard should be JSON");
+    assert_eq!(unregistered["repositories"][0]["state"], "unregistered");
+    assert_eq!(
+        unregistered["repositories"][0]["worktrees"][0]["services"][0]["port"],
+        port
+    );
+}
+
+#[test]
 fn packages_own_distinct_stable_ports_across_runners_and_scripts() {
     let repository = TestRepository::new();
     let web = repository.path().join("apps/web");

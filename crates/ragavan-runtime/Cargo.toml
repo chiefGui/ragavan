@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 ragavan-core.workspace = true
 ragavan-diagnostics.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]

@@ -1,5 +1,5 @@
 use crate::presentation::{HumanOutput, Response};
-use ragavan_core::Enrollment;
+use ragavan_application::Enrollment;
 use serde_json::{Map, Value as JsonValue};
 use std::io;
 

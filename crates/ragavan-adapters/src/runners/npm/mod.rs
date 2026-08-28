@@ -14,7 +14,7 @@ fn recognize(arguments: &[OsString]) -> Option<DevelopmentCommand<'_>> {
     let separator = arguments.iter().position(|argument| argument == "--");
     let runner_arguments = separator.map_or(arguments, |index| &arguments[..index]);
     let forwarded_arguments = separator.map_or(&[][..], |index| &arguments[index + 1..]);
-    let mut package_target = PackageTarget::CurrentDirectory;
+    let mut package_target = PackageTarget::WorkingDirectory;
     let mut include_workspace_root = false;
     let mut words = [None; 3];
     let mut word_count = 0;
@@ -89,7 +89,7 @@ fn recognize(arguments: &[OsString]) -> Option<DevelopmentCommand<'_>> {
         index += 1;
     }
 
-    if include_workspace_root && !matches!(package_target, PackageTarget::CurrentDirectory) {
+    if include_workspace_root && !matches!(package_target, PackageTarget::WorkingDirectory) {
         package_target = PackageTarget::Multiple;
     }
 

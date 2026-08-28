@@ -149,6 +149,7 @@ dependencies = [
 name = "ragavan"
 version = "0.3.0"
 dependencies = [
+ "ragavan-application",
  "ragavan-cli",
  "serde_json",
 ]
@@ -164,17 +165,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ragavan-application"
+version = "0.3.0"
+dependencies = [
+ "ragavan-adapters",
+ "ragavan-core",
+ "ragavan-diagnostics",
+ "ragavan-git",
+ "ragavan-runtime",
+ "ragavan-shell",
+ "thiserror",
+]
+
+[[package]]
 name = "ragavan-cli"
 version = "0.3.0"
 dependencies = [
  "anstream",
  "anstyle",
  "clap",
- "ragavan-adapters",
- "ragavan-core",
+ "ragavan-application",
  "ragavan-diagnostics",
- "ragavan-git",
- "ragavan-runtime",
  "ragavan-shell",
  "serde_json",
  "thiserror",
@@ -205,6 +216,7 @@ version = "0.3.0"
 dependencies = [
  "ragavan-core",
  "ragavan-diagnostics",
+ "serde",
  "serde_json",
 ]
 
@@ -222,6 +234,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

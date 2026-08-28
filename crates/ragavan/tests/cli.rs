@@ -9,6 +9,23 @@ use std::{env, process::Command};
 const DISABLED: &str = "Ragavan is disabled for this repository.\n";
 
 #[test]
+fn application_repository_queries_target_an_explicit_directory() {
+    let repository = TestRepository::new();
+    assert_stdout(
+        git(
+            repository.path(),
+            &["config", "--local", "ragavan.enabled", "true"],
+        ),
+        "",
+    );
+
+    let enrollment = ragavan_application::repository_status(repository.path())
+        .expect("the application should inspect the selected repository");
+
+    assert_eq!(enrollment, ragavan_application::Enrollment::Enabled);
+}
+
+#[test]
 fn enrollment_applies_to_existing_and_future_worktrees() {
     let repository = TestRepository::new();
     assert_stdout(
@@ -80,11 +97,35 @@ fn enrollment_requires_a_git_repository() {
     let output = ragavan(directory.path(), &["enable"]);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(stderr(&output).starts_with("error[git.command]:"));
+    assert!(stderr(&output).starts_with("error[git.worktree.required]:"));
     assert!(
-        stderr(&output).contains("could not enable Ragavan for the repository"),
+        stderr(&output).contains("the selected directory is not in a Git worktree"),
         "{output:?}"
     );
+}
+
+#[test]
+fn enrollment_validation_precedes_repository_identity_creation() {
+    let directory = TempDirectory::new();
+    let bare_repository = directory.path().join("bare.git");
+    let initialized = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&bare_repository)
+        .output()
+        .expect("Git should start");
+    assert_success(&initialized);
+
+    let output = ragavan(&bare_repository, &["enable"]);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).starts_with("error[git.worktree.required]:"));
+    let repository_id = Command::new("git")
+        .arg("--git-dir")
+        .arg(&bare_repository)
+        .args(["config", "--local", "--get", "ragavan.repositoryId"])
+        .output()
+        .expect("Git should start");
+    assert_eq!(repository_id.status.code(), Some(1), "{repository_id:?}");
 }
 
 #[test]
@@ -339,6 +380,7 @@ fn no_command_prints_help_before_repository_access() {
     assert!(stdout(&output).contains("install"));
     assert!(stdout(&output).contains("uninstall"));
     assert!(stdout(&output).contains("enable"));
+    assert!(stdout(&output).contains("dashboard"));
     assert!(stdout(&output).contains("--json"));
     assert_eq!(stderr(&output), "");
 }
@@ -397,17 +439,15 @@ fn json_errors_expose_stable_diagnostics() {
     assert_eq!(operation.status.code(), Some(1), "{operation:?}");
     assert_eq!(stdout(&operation), "", "{operation:?}");
     let operation_error = json_stderr(&operation);
-    assert_eq!(operation_error["error"]["code"], "git.command");
+    assert_eq!(operation_error["error"]["code"], "git.worktree.required");
     assert_eq!(
         operation_error["error"]["details"]["operation"],
         "enable Ragavan for the repository"
     );
-    assert!(operation_error["error"]["details"]["status"].is_string());
-    assert!(operation_error["error"]["details"]["output"].is_string());
     assert!(
         operation_error["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("could not enable Ragavan")),
+            .is_some_and(|message| message.contains("not in a Git worktree")),
         "{operation:?}"
     );
 

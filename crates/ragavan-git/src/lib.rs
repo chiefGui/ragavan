@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-use ragavan_core::{Enrollment, IdentityError, WorktreeIdentity};
+use ragavan_core::{Enrollment, IdentityError, RepositoryId, WorktreeIdentity};
 use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
-    fmt, io,
+    fmt, fs, io,
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output},
     sync::atomic::{AtomicU64, Ordering},
@@ -16,62 +16,106 @@ const GIT_CONFIG_GET_MISSING: i32 = 1;
 const GIT_CONFIG_UNSET_MISSING: i32 = 5;
 static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
-pub fn enable() -> Result<Enrollment, Error> {
-    ensure_repository_id()?;
+/// A validated Git repository awaiting the final enable transition.
+pub struct EnableRepository {
+    common_directory: PathBuf,
+    repository_id: RepositoryId,
+}
 
-    const OPERATION: &str = "enable Ragavan for the repository";
-    let output = git(
-        OPERATION,
-        &["config", "--local", "--replace-all", ENROLLMENT_KEY, "true"],
-    )?;
+impl EnableRepository {
+    /// Return the identity that must be registered before enabling completes.
+    pub fn repository_id(&self) -> &RepositoryId {
+        &self.repository_id
+    }
 
-    if output.status.success() {
+    /// Return the Git common directory that must be registered.
+    pub fn common_directory(&self) -> &Path {
+        &self.common_directory
+    }
+
+    /// Mark the repository enabled after its global registration succeeds.
+    pub fn complete(self) -> Result<Enrollment, Error> {
+        const OPERATION: &str = "enable Ragavan for the repository";
+        replace_local_config_at(OPERATION, &self.common_directory, ENROLLMENT_KEY, "true")?;
         Ok(Enrollment::Enabled)
-    } else {
-        Err(Error::git(OPERATION, output))
     }
 }
 
-pub fn status() -> Result<Enrollment, Error> {
+/// Validate a repository and ensure it has an identity without marking it enabled.
+pub fn begin_enable(directory: &Path) -> Result<EnableRepository, Error> {
+    const OPERATION: &str = "enable Ragavan for the repository";
+    let context = repository_context_at(directory, false)?.ok_or(Error::WorktreeRequired {
+        operation: OPERATION,
+    })?;
+    let repository_id = ensure_repository_id(&context.common_dir)?;
+    Ok(EnableRepository {
+        common_directory: context.common_dir,
+        repository_id,
+    })
+}
+
+/// Read the repository enrollment stored by Git.
+pub fn status(directory: &Path) -> Result<Enrollment, Error> {
     const OPERATION: &str = "read the repository enrollment";
-    let output = git(
+    let output = git_at(
         OPERATION,
+        directory,
         &["config", "--local", "--bool", "--get", ENROLLMENT_KEY],
     )?;
-
-    if output.status.success() {
-        return match output.stdout.trim_ascii() {
-            b"true" => Ok(Enrollment::Enabled),
-            b"false" => Ok(Enrollment::Disabled),
-            _ => Err(Error::UnexpectedGitOutput {
-                operation: OPERATION,
-                output: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            }),
-        };
-    }
-    if output.status.code() == Some(GIT_CONFIG_GET_MISSING) {
-        return Ok(Enrollment::Disabled);
-    }
-
-    Err(Error::git(OPERATION, output))
+    enrollment_from_output(OPERATION, output)
 }
 
-pub fn disable() -> Result<Enrollment, Error> {
+/// A disabled Git repository retaining its identity until global unregistration succeeds.
+pub struct DisableRepository {
+    common_directory: PathBuf,
+    repository_id: Option<RepositoryId>,
+}
+
+impl DisableRepository {
+    /// Return the identity to unregister, when it was valid.
+    pub fn repository_id(&self) -> Option<&RepositoryId> {
+        self.repository_id.as_ref()
+    }
+
+    /// Return the Git common directory paired with the registration.
+    pub fn common_directory(&self) -> &Path {
+        &self.common_directory
+    }
+
+    /// Remove the retained repository identity after global unregistration succeeds.
+    pub fn complete(self) -> Result<Enrollment, Error> {
+        const OPERATION: &str = "disable Ragavan for the repository";
+        unset_local_config_at(OPERATION, &self.common_directory, REPOSITORY_ID_KEY)?;
+        Ok(Enrollment::Disabled)
+    }
+}
+
+/// Mark a repository disabled while retaining the identity needed for unregistration.
+pub fn begin_disable(directory: &Path) -> Result<DisableRepository, Error> {
     const OPERATION: &str = "disable Ragavan for the repository";
-    unset_local_config(OPERATION, ENROLLMENT_KEY)?;
-    unset_local_config(OPERATION, REPOSITORY_ID_KEY)?;
-    Ok(Enrollment::Disabled)
+    let context = repository_context_at(directory, false)?.ok_or(Error::WorktreeRequired {
+        operation: OPERATION,
+    })?;
+    let repository_id = local_config_at(OPERATION, &context.common_dir, REPOSITORY_ID_KEY)?
+        .and_then(|value| RepositoryId::new(value).ok());
+    unset_local_config_at(OPERATION, &context.common_dir, ENROLLMENT_KEY)?;
+    Ok(DisableRepository {
+        common_directory: context.common_dir,
+        repository_id,
+    })
 }
 
-pub fn enrolled_worktree() -> Result<Option<EnrolledWorktree>, Error> {
-    let Some(context) = repository_context()? else {
+/// Return the managed worktree containing `directory`, when its repository is enabled.
+pub fn managed_worktree(directory: &Path) -> Result<Option<ManagedWorktree>, Error> {
+    let Some(context) = repository_context_at(directory, true)? else {
         return Ok(None);
     };
-    if matches!(status()?, Enrollment::Disabled) {
+    if matches!(status(directory)?, Enrollment::Disabled) {
         return Ok(None);
     }
 
-    Ok(Some(EnrolledWorktree { context }))
+    let identity = identity_for(&context)?;
+    Ok(Some(ManagedWorktree { context, identity }))
 }
 
 /// Return tracked and unignored untracked files with the requested basename.
@@ -133,67 +177,83 @@ pub fn source_files_named(root: &Path, file_name: &str) -> Result<Vec<PathBuf>, 
         .collect()
 }
 
-pub struct EnrolledWorktree {
+pub struct ManagedWorktree {
     context: RepositoryContext,
+    identity: WorktreeIdentity,
 }
 
-impl EnrolledWorktree {
+impl ManagedWorktree {
+    /// Return the worktree root.
     pub fn root(&self) -> &Path {
         &self.context.root
     }
 
-    pub fn identity(&self) -> Result<WorktreeIdentity, Error> {
-        let repository_id =
-            local_config("read the Ragavan repository identity", REPOSITORY_ID_KEY)?
-                .ok_or(Error::MissingRepositoryId)?;
+    /// Return the repository and worktree identity.
+    pub fn identity(&self) -> &WorktreeIdentity {
+        &self.identity
+    }
 
-        let worktree_id = if self.context.git_dir == self.context.common_dir {
-            "main".to_owned()
-        } else {
-            self.context
-                .git_dir
-                .strip_prefix(&self.context.common_dir)
-                .map_err(|_| Error::UnexpectedRepositoryLayout {
-                    common_dir: self.context.common_dir.clone(),
-                    git_dir: self.context.git_dir.clone(),
-                })?
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
-
-        WorktreeIdentity::new(repository_id, worktree_id).map_err(|error| match error {
-            IdentityError::EmptyRepository => Error::InvalidRepositoryId,
-            IdentityError::EmptyWorktree => Error::InvalidWorktreeId,
-        })
+    /// Return the repository's Git common directory.
+    pub fn common_directory(&self) -> &Path {
+        &self.context.common_dir
     }
 }
 
-fn ensure_repository_id() -> Result<(), Error> {
+fn identity_for(context: &RepositoryContext) -> Result<WorktreeIdentity, Error> {
+    let repository_id = local_config_at(
+        "read the Ragavan repository identity",
+        &context.common_dir,
+        REPOSITORY_ID_KEY,
+    )?
+    .ok_or(Error::MissingRepositoryId)
+    .and_then(parse_repository_id)?;
+    let worktree_id = worktree_id(context)?;
+
+    WorktreeIdentity::new(repository_id, worktree_id).map_err(|error| match error {
+        IdentityError::EmptyRepository => Error::InvalidRepositoryId,
+        IdentityError::EmptyWorktree => Error::InvalidWorktreeId,
+    })
+}
+
+fn worktree_id(context: &RepositoryContext) -> Result<String, Error> {
+    if context.git_dir == context.common_dir {
+        return Ok("main".to_owned());
+    }
+
+    let worktree_id = context
+        .git_dir
+        .strip_prefix(&context.common_dir)
+        .map_err(|_| Error::UnexpectedRepositoryLayout {
+            common_dir: context.common_dir.clone(),
+            git_dir: context.git_dir.clone(),
+        })?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if worktree_id.is_empty() {
+        Err(Error::InvalidWorktreeId)
+    } else {
+        Ok(worktree_id)
+    }
+}
+
+fn ensure_repository_id(common_directory: &Path) -> Result<RepositoryId, Error> {
     const OPERATION: &str = "enable Ragavan for the repository";
-    if let Some(repository_id) = local_config(OPERATION, REPOSITORY_ID_KEY)? {
-        if repository_id.is_empty() {
-            return Err(Error::InvalidRepositoryId);
-        }
-        return Ok(());
+    if let Some(repository_id) = local_config_at(OPERATION, common_directory, REPOSITORY_ID_KEY)? {
+        return parse_repository_id(repository_id);
     }
 
     let repository_id = new_repository_id();
-    let output = git(
+    replace_local_config_at(
         OPERATION,
-        &[
-            "config",
-            "--local",
-            "--replace-all",
-            REPOSITORY_ID_KEY,
-            &repository_id,
-        ],
+        common_directory,
+        REPOSITORY_ID_KEY,
+        &repository_id,
     )?;
+    parse_repository_id(repository_id)
+}
 
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::git(OPERATION, output))
-    }
+fn parse_repository_id(value: String) -> Result<RepositoryId, Error> {
+    RepositoryId::new(value).map_err(|_| Error::InvalidRepositoryId)
 }
 
 fn new_repository_id() -> String {
@@ -207,9 +267,159 @@ fn new_repository_id() -> String {
     format!("{timestamp:032x}{process_id:08x}{sequence:016x}")
 }
 
-fn local_config(operation: &'static str, key: &str) -> Result<Option<String>, Error> {
-    let output = git(operation, &["config", "--local", "--get", key])?;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RepositoryIdentity {
+    Missing,
+    Invalid,
+    Valid(RepositoryId),
+}
 
+impl RepositoryIdentity {
+    pub fn repository_id(&self) -> Option<&RepositoryId> {
+        match self {
+            Self::Valid(repository_id) => Some(repository_id),
+            Self::Missing | Self::Invalid => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// The stable Git location shared by every worktree in one repository.
+pub struct RepositoryLocation {
+    common_directory: PathBuf,
+}
+
+impl RepositoryLocation {
+    /// Return the Git common directory.
+    pub fn common_directory(&self) -> &Path {
+        &self.common_directory
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryInspection {
+    enrollment: Enrollment,
+    identity: RepositoryIdentity,
+    worktrees: Vec<WorktreeInspection>,
+}
+
+impl RepositoryInspection {
+    pub fn enrollment(&self) -> Enrollment {
+        self.enrollment
+    }
+
+    pub fn identity(&self) -> &RepositoryIdentity {
+        &self.identity
+    }
+
+    pub fn worktrees(&self) -> &[WorktreeInspection] {
+        &self.worktrees
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorktreeInspection {
+    Available { id: String, path: PathBuf },
+    Unavailable { path: PathBuf },
+}
+
+impl WorktreeInspection {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Available { path, .. } | Self::Unavailable { path } => path,
+        }
+    }
+}
+
+/// Identify the Git repository containing a directory without changing state.
+pub fn locate_repository(directory: &Path) -> Result<Option<RepositoryLocation>, Error> {
+    let Some(context) = repository_context_at(directory, false)? else {
+        return Ok(None);
+    };
+    Ok(Some(RepositoryLocation {
+        common_directory: context.common_dir,
+    }))
+}
+
+/// Inspect one registered repository and all worktrees Git can currently describe.
+pub fn inspect_repository(common_directory: &Path) -> Result<Option<RepositoryInspection>, Error> {
+    match fs::metadata(common_directory) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(Error::InvalidCommonDirectory {
+                path: common_directory.to_owned(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::InspectCommonDirectory {
+                path: common_directory.to_owned(),
+                source,
+            });
+        }
+    }
+
+    let enrollment = enrollment_at(common_directory)?;
+    let identity = configured_identity(local_config_at(
+        "read a registered Ragavan repository identity",
+        common_directory,
+        REPOSITORY_ID_KEY,
+    )?);
+    let worktrees = list_worktrees(common_directory)?;
+
+    Ok(Some(RepositoryInspection {
+        enrollment,
+        identity,
+        worktrees,
+    }))
+}
+
+fn configured_identity(value: Option<String>) -> RepositoryIdentity {
+    match value {
+        None => RepositoryIdentity::Missing,
+        Some(value) => {
+            RepositoryId::new(value).map_or(RepositoryIdentity::Invalid, RepositoryIdentity::Valid)
+        }
+    }
+}
+
+fn enrollment_at(common_directory: &Path) -> Result<Enrollment, Error> {
+    const OPERATION: &str = "read a registered repository enrollment";
+    let output = git_in_common_directory(
+        OPERATION,
+        common_directory,
+        &["config", "--local", "--bool", "--get", ENROLLMENT_KEY],
+    )?;
+    enrollment_from_output(OPERATION, output)
+}
+
+fn enrollment_from_output(operation: &'static str, output: Output) -> Result<Enrollment, Error> {
+    if output.status.success() {
+        return match output.stdout.trim_ascii() {
+            b"true" => Ok(Enrollment::Enabled),
+            b"false" => Ok(Enrollment::Disabled),
+            _ => Err(Error::UnexpectedGitOutput {
+                operation,
+                output: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            }),
+        };
+    }
+    if output.status.code() == Some(GIT_CONFIG_GET_MISSING) {
+        return Ok(Enrollment::Disabled);
+    }
+    Err(Error::git(operation, output))
+}
+
+fn local_config_at(
+    operation: &'static str,
+    common_directory: &Path,
+    key: &str,
+) -> Result<Option<String>, Error> {
+    let output = git_in_common_directory(
+        operation,
+        common_directory,
+        &["config", "--local", "--get", key],
+    )?;
     if output.status.success() {
         return Ok(Some(
             String::from_utf8_lossy(&output.stdout).trim().to_owned(),
@@ -218,18 +428,94 @@ fn local_config(operation: &'static str, key: &str) -> Result<Option<String>, Er
     if output.status.code() == Some(GIT_CONFIG_GET_MISSING) {
         return Ok(None);
     }
-
     Err(Error::git(operation, output))
 }
 
-fn unset_local_config(operation: &'static str, key: &str) -> Result<(), Error> {
-    let output = git(operation, &["config", "--local", "--unset-all", key])?;
+fn replace_local_config_at(
+    operation: &'static str,
+    common_directory: &Path,
+    key: &str,
+    value: &str,
+) -> Result<(), Error> {
+    let output = git_in_common_directory(
+        operation,
+        common_directory,
+        &["config", "--local", "--replace-all", key, value],
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::git(operation, output))
+    }
+}
 
+fn unset_local_config_at(
+    operation: &'static str,
+    common_directory: &Path,
+    key: &str,
+) -> Result<(), Error> {
+    let output = git_in_common_directory(
+        operation,
+        common_directory,
+        &["config", "--local", "--unset-all", key],
+    )?;
     if output.status.success() || output.status.code() == Some(GIT_CONFIG_UNSET_MISSING) {
         Ok(())
     } else {
         Err(Error::git(operation, output))
     }
+}
+
+fn list_worktrees(common_directory: &Path) -> Result<Vec<WorktreeInspection>, Error> {
+    const OPERATION: &str = "list registered repository worktrees";
+    let output = git_in_common_directory(
+        OPERATION,
+        common_directory,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?;
+    if !output.status.success() {
+        return Err(Error::git(OPERATION, output));
+    }
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|source| Error::NonUtf8GitOutput {
+        operation: OPERATION,
+        source,
+    })?;
+    if !stdout.is_empty() && !stdout.ends_with("\0\0") {
+        return Err(Error::UnexpectedGitOutput {
+            operation: OPERATION,
+            output: stdout.to_owned(),
+        });
+    }
+
+    let mut worktrees = Vec::new();
+    for record in stdout.split("\0\0").filter(|record| !record.is_empty()) {
+        let mut fields = record.split('\0');
+        let Some(path) = fields
+            .next()
+            .and_then(|field| field.strip_prefix("worktree "))
+        else {
+            return Err(Error::UnexpectedGitOutput {
+                operation: OPERATION,
+                output: record.to_owned(),
+            });
+        };
+        let path = PathBuf::from(path);
+        let prunable = fields.any(|field| field == "prunable" || field.starts_with("prunable "));
+        let worktree = if prunable {
+            WorktreeInspection::Unavailable { path }
+        } else {
+            match repository_context_at(&path, true)? {
+                Some(context) => WorktreeInspection::Available {
+                    id: worktree_id(&context)?,
+                    path,
+                },
+                None => WorktreeInspection::Unavailable { path },
+            }
+        };
+        worktrees.push(worktree);
+    }
+    worktrees.sort_by(|left, right| left.path().cmp(right.path()));
+    Ok(worktrees)
 }
 
 struct RepositoryContext {
@@ -238,9 +524,20 @@ struct RepositoryContext {
     root: PathBuf,
 }
 
-fn repository_context() -> Result<Option<RepositoryContext>, Error> {
-    const OPERATION: &str = "identify the current Git worktree";
+fn repository_context_at(
+    directory: &Path,
+    missing_git_is_absent: bool,
+) -> Result<Option<RepositoryContext>, Error> {
+    repository_context_in(directory, missing_git_is_absent)
+}
+
+fn repository_context_in(
+    directory: &Path,
+    missing_git_is_absent: bool,
+) -> Result<Option<RepositoryContext>, Error> {
+    const OPERATION: &str = "identify a Git worktree";
     let output = match Command::new("git")
+        .current_dir(directory)
         .args([
             "rev-parse",
             "--is-inside-work-tree",
@@ -252,7 +549,9 @@ fn repository_context() -> Result<Option<RepositoryContext>, Error> {
         .output()
     {
         Ok(output) => output,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if missing_git_is_absent && error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
         Err(source) => {
             return Err(Error::StartGit {
                 operation: OPERATION,
@@ -291,24 +590,30 @@ fn repository_context() -> Result<Option<RepositoryContext>, Error> {
     }
 }
 
-fn git(operation: &'static str, arguments: &[&str]) -> Result<Output, Error> {
-    git_command(operation, None, arguments)
+fn git_at(operation: &'static str, directory: &Path, arguments: &[&str]) -> Result<Output, Error> {
+    git_command(operation, directory, arguments)
 }
 
-fn git_at(operation: &'static str, directory: &Path, arguments: &[&str]) -> Result<Output, Error> {
-    git_command(operation, Some(directory), arguments)
+fn git_in_common_directory(
+    operation: &'static str,
+    common_directory: &Path,
+    arguments: &[&str],
+) -> Result<Output, Error> {
+    Command::new("git")
+        .arg("--git-dir")
+        .arg(common_directory)
+        .args(arguments)
+        .output()
+        .map_err(|source| Error::StartGit { operation, source })
 }
 
 fn git_command(
     operation: &'static str,
-    directory: Option<&Path>,
+    directory: &Path,
     arguments: &[&str],
 ) -> Result<Output, Error> {
-    let mut command = Command::new("git");
-    if let Some(directory) = directory {
-        command.current_dir(directory);
-    }
-    command
+    Command::new("git")
+        .current_dir(directory)
         .args(arguments)
         .output()
         .map_err(|source| Error::StartGit { operation, source })
@@ -340,6 +645,16 @@ pub enum Error {
     UnexpectedRepositoryLayout {
         common_dir: PathBuf,
         git_dir: PathBuf,
+    },
+    WorktreeRequired {
+        operation: &'static str,
+    },
+    InvalidCommonDirectory {
+        path: PathBuf,
+    },
+    InspectCommonDirectory {
+        path: PathBuf,
+        source: io::Error,
     },
 }
 
@@ -406,6 +721,22 @@ impl fmt::Display for Error {
                 git_dir.display(),
                 common_dir.display()
             ),
+            Self::WorktreeRequired { operation } => {
+                write!(
+                    formatter,
+                    "could not {operation}: the selected directory is not in a Git worktree"
+                )
+            }
+            Self::InvalidCommonDirectory { path } => write!(
+                formatter,
+                "registered Git common directory {} is not a directory",
+                path.display()
+            ),
+            Self::InspectCommonDirectory { path, source } => write!(
+                formatter,
+                "could not inspect registered Git common directory {}: {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -415,6 +746,7 @@ impl std::error::Error for Error {
         match self {
             Self::StartGit { source, .. } => Some(source),
             Self::NonUtf8GitOutput { source, .. } => Some(source),
+            Self::InspectCommonDirectory { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -432,16 +764,20 @@ impl Diagnostic for Error {
             Self::InvalidWorktreeId => "git.worktree_identity.invalid",
             Self::MissingRepositoryId => "git.repository_identity.missing",
             Self::UnexpectedRepositoryLayout { .. } => "git.worktree_layout.unexpected",
+            Self::WorktreeRequired { .. } => "git.worktree.required",
+            Self::InvalidCommonDirectory { .. } => "git.common_directory.invalid",
+            Self::InspectCommonDirectory { .. } => "git.common_directory.inspect",
         }
     }
 
     fn help(&self) -> Option<String> {
         match self {
             Self::InvalidRepositoryId => {
-                Some("run `ragavan disable`, then run `ragavan enable` again".to_owned())
+                Some("disable and re-enable Ragavan for this repository".to_owned())
             }
-            Self::MissingRepositoryId => {
-                Some("run `ragavan enable` once in this repository".to_owned())
+            Self::MissingRepositoryId => Some("enable Ragavan for this repository".to_owned()),
+            Self::WorktreeRequired { .. } => {
+                Some("select a directory in a non-bare Git worktree".to_owned())
             }
             _ => None,
         }
@@ -475,6 +811,12 @@ impl Diagnostic for Error {
                 Detail::text("common_directory", common_dir.display().to_string()),
                 Detail::text("worktree_directory", git_dir.display().to_string()),
             ],
+            Self::WorktreeRequired { operation } => {
+                vec![Detail::text("operation", *operation)]
+            }
+            Self::InvalidCommonDirectory { path } | Self::InspectCommonDirectory { path, .. } => {
+                vec![Detail::text("path", path.display().to_string())]
+            }
             Self::InvalidRepositoryId | Self::InvalidWorktreeId | Self::MissingRepositoryId => {
                 Vec::new()
             }

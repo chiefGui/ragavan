@@ -2,6 +2,7 @@
 members = [
     "crates/ragavan",
     "crates/ragavan-adapters",
+    "crates/ragavan-application",
     "crates/ragavan-cli",
     "crates/ragavan-core",
     "crates/ragavan-diagnostics",
@@ -24,12 +25,14 @@ anstream = "1.0"
 anstyle = "1.0"
 clap = { version = "4.6", default-features = false, features = ["color", "derive", "error-context", "help", "std", "usage"] }
 ragavan-adapters = { path = "crates/ragavan-adapters" }
+ragavan-application = { path = "crates/ragavan-application" }
 ragavan-cli = { path = "crates/ragavan-cli" }
 ragavan-core = { path = "crates/ragavan-core" }
 ragavan-diagnostics = { path = "crates/ragavan-diagnostics" }
 ragavan-git = { path = "crates/ragavan-git" }
 ragavan-runtime = { path = "crates/ragavan-runtime" }
 ragavan-shell = { path = "crates/ragavan-shell" }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 

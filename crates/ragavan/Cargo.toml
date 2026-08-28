@@ -11,6 +11,7 @@ repository.workspace = true
 ragavan-cli.workspace = true
 
 [dev-dependencies]
+ragavan-application.workspace = true
 serde_json.workspace = true
 
 [lints]

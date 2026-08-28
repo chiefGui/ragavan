@@ -12,17 +12,46 @@ pub enum Enrollment {
     Disabled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether Ragavan currently holds a service's coordination lease.
+pub enum LeaseState {
+    /// The service lock is currently held.
+    Active,
+    /// The stable assignment remains, but no process holds its service lock.
+    Inactive,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RepositoryId(String);
+
+impl RepositoryId {
+    pub fn new(value: String) -> Result<Self, IdentityError> {
+        if value.is_empty() {
+            return Err(IdentityError::EmptyRepository);
+        }
+
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RepositoryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorktreeIdentity {
-    repository_id: String,
+    repository_id: RepositoryId,
     worktree_id: String,
 }
 
 impl WorktreeIdentity {
-    pub fn new(repository_id: String, worktree_id: String) -> Result<Self, IdentityError> {
-        if repository_id.is_empty() {
-            return Err(IdentityError::EmptyRepository);
-        }
+    pub fn new(repository_id: RepositoryId, worktree_id: String) -> Result<Self, IdentityError> {
         if worktree_id.is_empty() {
             return Err(IdentityError::EmptyWorktree);
         }
@@ -33,7 +62,7 @@ impl WorktreeIdentity {
         })
     }
 
-    pub fn repository_id(&self) -> &str {
+    pub fn repository_id(&self) -> &RepositoryId {
         &self.repository_id
     }
 
@@ -78,7 +107,7 @@ impl Diagnostic for IdentityError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ServiceScope(Option<String>);
 
 impl ServiceScope {
@@ -144,7 +173,7 @@ impl Diagnostic for ServiceScopeError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ServiceIdentity {
     worktree: WorktreeIdentity,
     scope: ServiceScope,
@@ -202,7 +231,10 @@ impl LaunchPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceIdentity, ServiceScope, ServiceScopeError, WorktreeIdentity};
+    use super::{
+        IdentityError, RepositoryId, ServiceIdentity, ServiceScope, ServiceScopeError,
+        WorktreeIdentity,
+    };
     use std::path::Path;
 
     #[test]
@@ -244,8 +276,26 @@ mod tests {
         assert_eq!(absolute, ServiceScopeError::NonRelativePath);
     }
 
+    #[test]
+    fn repository_identifiers_cannot_be_empty() {
+        assert_eq!(
+            RepositoryId::new(String::new()),
+            Err(IdentityError::EmptyRepository)
+        );
+        assert_eq!(
+            RepositoryId::new("repository".to_owned())
+                .expect("the repository identity should be valid")
+                .as_str(),
+            "repository"
+        );
+    }
+
     fn worktree() -> WorktreeIdentity {
-        WorktreeIdentity::new("repository".to_owned(), "worktree".to_owned())
-            .expect("the worktree identity should be valid")
+        WorktreeIdentity::new(
+            RepositoryId::new("repository".to_owned())
+                .expect("the repository identity should be valid"),
+            "worktree".to_owned(),
+        )
+        .expect("the worktree identity should be valid")
     }
 }
