@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ragavan-application",
  "ragavan-cli",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-adapters"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ragavan-core",
  "ragavan-diagnostics",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-application"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ragavan-adapters",
  "ragavan-core",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -193,18 +193,18 @@ dependencies = [
 
 [[package]]
 name = "ragavan-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ragavan-diagnostics",
 ]
 
 [[package]]
 name = "ragavan-diagnostics"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "ragavan-git"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ragavan-core",
  "ragavan-diagnostics",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ragavan-core",
  "ragavan-diagnostics",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "ragavan-shell"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ragavan-diagnostics",
 ]
