@@ -10,6 +10,7 @@ pub use dashboard::{
     RepositoryState, WorktreeState,
 };
 pub use ragavan_core::{Enrollment, LeaseState, RepositoryId};
+pub use ragavan_shell::{InstallOutcome, Shell, ShellTarget, UninstallOutcome, shell, shells};
 
 use ragavan_core::{LaunchPlan, ServiceIdentity};
 use ragavan_diagnostics::{Detail, Diagnostic};
@@ -51,8 +52,18 @@ pub fn dashboard(scope: DashboardScope<'_>) -> Result<Dashboard, Error> {
     dashboard::load(scope)
 }
 
+/// Install persistent Ragavan integration for the selected shell.
+pub fn install_shell(target: ShellTarget) -> Result<InstallOutcome, Error> {
+    ragavan_shell::install(target).map_err(Error::from)
+}
+
+/// Remove persistent Ragavan integration from the selected shell.
+pub fn uninstall_shell(target: ShellTarget) -> Result<UninstallOutcome, Error> {
+    ragavan_shell::uninstall(target).map_err(Error::from)
+}
+
 /// Render the shell hook for every command Ragavan can isolate.
-pub fn shell_hook(shell: ragavan_shell::Shell, native_executable: &Path) -> Result<String, Error> {
+pub fn shell_hook(shell: Shell, native_executable: &Path) -> Result<String, Error> {
     ragavan_shell::hook(shell, native_executable, ragavan_adapters::commands()).map_err(Error::from)
 }
 
@@ -95,14 +106,14 @@ fn isolate_command(
     else {
         return Ok(None);
     };
-    let Some(worktree) = ragavan_git::managed_worktree(working_directory)? else {
+    let Some(worktree) = ragavan_git::begin_managed_command(working_directory)? else {
         return Ok(None);
     };
+    let isolation = development_command.resolve(working_directory, worktree.root())?;
     ragavan_runtime::register_repository(
         worktree.identity().repository_id(),
         worktree.common_directory(),
     )?;
-    let isolation = development_command.resolve(working_directory, worktree.root())?;
     let identity = ServiceIdentity::new(
         worktree.identity().clone(),
         isolation.service_scope().clone(),

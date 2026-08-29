@@ -11,7 +11,7 @@ use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use presentation::Format;
-use ragavan_application::DashboardScope;
+use ragavan_application::{DashboardScope, Shell, ShellTarget};
 use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{env, ffi::OsString, io, path::PathBuf, process::ExitStatus};
 use thiserror::Error;
@@ -54,11 +54,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> i32 {
 
     match command {
         Command::Install { shell } => complete(
-            ragavan_shell::install(shell_target(shell)).map_err(Failure::from),
+            ragavan_application::install_shell(shell_target(shell)).map_err(Failure::from),
             format,
         ),
         Command::Uninstall { shell } => complete(
-            ragavan_shell::uninstall(shell_target(shell)).map_err(Failure::from),
+            ragavan_application::uninstall_shell(shell_target(shell)).map_err(Failure::from),
             format,
         ),
         Command::Enable => complete(
@@ -148,13 +148,13 @@ enum Command {
     Install {
         /// Select a shell when automatic detection is unavailable.
         #[arg(value_parser = shell_parser())]
-        shell: Option<ragavan_shell::Shell>,
+        shell: Option<Shell>,
     },
     /// Remove persistent integration from the current shell.
     Uninstall {
         /// Select a shell when automatic detection is unavailable.
         #[arg(value_parser = shell_parser())]
-        shell: Option<ragavan_shell::Shell>,
+        shell: Option<Shell>,
     },
     /// Enable Ragavan for the current repository.
     Enable,
@@ -171,20 +171,18 @@ enum Command {
     /// Print shell integration.
     Hook {
         #[arg(value_parser = shell_parser())]
-        shell: ragavan_shell::Shell,
+        shell: Shell,
     },
 }
 
-fn shell_parser() -> impl TypedValueParser<Value = ragavan_shell::Shell> {
-    PossibleValuesParser::new(ragavan_shell::shells().map(|shell| shell.name())).map(|name| {
-        ragavan_shell::shell(&name).expect("every advertised shell must remain registered")
+fn shell_parser() -> impl TypedValueParser<Value = Shell> {
+    PossibleValuesParser::new(ragavan_application::shells().map(|shell| shell.name())).map(|name| {
+        ragavan_application::shell(&name).expect("every advertised shell must remain registered")
     })
 }
 
-fn shell_target(shell: Option<ragavan_shell::Shell>) -> ragavan_shell::ShellTarget {
-    shell.map_or(ragavan_shell::ShellTarget::Current, |shell| {
-        ragavan_shell::ShellTarget::Explicit(shell)
-    })
+fn shell_target(shell: Option<Shell>) -> ShellTarget {
+    shell.map_or(ShellTarget::Current, ShellTarget::Explicit)
 }
 
 fn report_parse_error(error: clap::Error, json_requested: bool) -> i32 {
@@ -401,8 +399,6 @@ enum Failure {
     CurrentDirectory(#[source] io::Error),
     #[error(transparent)]
     Application(#[from] ragavan_application::Error),
-    #[error(transparent)]
-    Shell(#[from] ragavan_shell::Error),
     #[error("could not write {output}: {source}")]
     WriteOutput {
         output: &'static str,
@@ -417,7 +413,6 @@ impl Diagnostic for Failure {
             Self::CurrentExecutable(_) => "cli.executable.locate",
             Self::CurrentDirectory(_) => "cli.directory.locate",
             Self::Application(error) => error.code(),
-            Self::Shell(error) => error.code(),
             Self::WriteOutput { .. } => "cli.output.write",
         }
     }
@@ -429,7 +424,6 @@ impl Diagnostic for Failure {
             }
             Self::CurrentDirectory(_) => None,
             Self::Application(error) => error.help(),
-            Self::Shell(error) => error.help(),
             Self::WriteOutput { .. } => None,
         }
     }
@@ -439,7 +433,6 @@ impl Diagnostic for Failure {
             Self::CurrentExecutable(_) => Vec::new(),
             Self::CurrentDirectory(_) => Vec::new(),
             Self::Application(error) => error.details(),
-            Self::Shell(error) => error.details(),
             Self::WriteOutput { output, .. } => vec![Detail::text("output", *output)],
         }
     }

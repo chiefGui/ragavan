@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
-use ragavan_core::{Enrollment, IdentityError, RepositoryId, WorktreeIdentity};
+use ragavan_core::{Enrollment, RepositoryId, WorktreeIdentity};
 use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
-    fmt, fs, io,
+    fmt,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output},
     sync::atomic::{AtomicU64, Ordering},
@@ -12,14 +14,16 @@ use std::{
 
 const ENROLLMENT_KEY: &str = "ragavan.enabled";
 const REPOSITORY_ID_KEY: &str = "ragavan.repositoryId";
+const REPOSITORY_LOCK_FILE: &str = "ragavan.lock";
 const GIT_CONFIG_GET_MISSING: i32 = 1;
 const GIT_CONFIG_UNSET_MISSING: i32 = 5;
 static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
-/// A validated Git repository awaiting the final enable transition.
+/// An exclusively held Git repository awaiting the final enable transition.
 pub struct EnableRepository {
     common_directory: PathBuf,
     repository_id: RepositoryId,
+    operation_lock: File,
 }
 
 impl EnableRepository {
@@ -36,7 +40,12 @@ impl EnableRepository {
     /// Mark the repository enabled after its global registration succeeds.
     pub fn complete(self) -> Result<Enrollment, Error> {
         const OPERATION: &str = "enable Ragavan for the repository";
-        replace_local_config_at(OPERATION, &self.common_directory, ENROLLMENT_KEY, "true")?;
+        let Self {
+            common_directory,
+            repository_id: _,
+            operation_lock: _operation_lock,
+        } = self;
+        replace_local_config_at(OPERATION, &common_directory, ENROLLMENT_KEY, "true")?;
         Ok(Enrollment::Enabled)
     }
 }
@@ -47,10 +56,12 @@ pub fn begin_enable(directory: &Path) -> Result<EnableRepository, Error> {
     let context = repository_context_at(directory, false)?.ok_or(Error::WorktreeRequired {
         operation: OPERATION,
     })?;
+    let operation_lock = lock_repository(&context.common_dir)?;
     let repository_id = ensure_repository_id(&context.common_dir)?;
     Ok(EnableRepository {
         common_directory: context.common_dir,
         repository_id,
+        operation_lock,
     })
 }
 
@@ -65,10 +76,11 @@ pub fn status(directory: &Path) -> Result<Enrollment, Error> {
     enrollment_from_output(OPERATION, output)
 }
 
-/// A disabled Git repository retaining its identity until global unregistration succeeds.
+/// An exclusively held disabled repository retaining its identity until unregistration succeeds.
 pub struct DisableRepository {
     common_directory: PathBuf,
     repository_id: Option<RepositoryId>,
+    operation_lock: File,
 }
 
 impl DisableRepository {
@@ -85,7 +97,12 @@ impl DisableRepository {
     /// Remove the retained repository identity after global unregistration succeeds.
     pub fn complete(self) -> Result<Enrollment, Error> {
         const OPERATION: &str = "disable Ragavan for the repository";
-        unset_local_config_at(OPERATION, &self.common_directory, REPOSITORY_ID_KEY)?;
+        let Self {
+            common_directory,
+            repository_id: _,
+            operation_lock: _operation_lock,
+        } = self;
+        unset_local_config_at(OPERATION, &common_directory, REPOSITORY_ID_KEY)?;
         Ok(Enrollment::Disabled)
     }
 }
@@ -96,26 +113,41 @@ pub fn begin_disable(directory: &Path) -> Result<DisableRepository, Error> {
     let context = repository_context_at(directory, false)?.ok_or(Error::WorktreeRequired {
         operation: OPERATION,
     })?;
-    let repository_id = local_config_at(OPERATION, &context.common_dir, REPOSITORY_ID_KEY)?
-        .and_then(|value| RepositoryId::new(value).ok());
+    let operation_lock = lock_repository(&context.common_dir)?;
+    let repository_id = match repository_id_at(OPERATION, &context.common_dir) {
+        Ok(value) => value.and_then(|value| RepositoryId::new(value).ok()),
+        Err(Error::InvalidRepositoryId) => None,
+        Err(error) => return Err(error),
+    };
     unset_local_config_at(OPERATION, &context.common_dir, ENROLLMENT_KEY)?;
     Ok(DisableRepository {
         common_directory: context.common_dir,
         repository_id,
+        operation_lock,
     })
 }
 
-/// Return the managed worktree containing `directory`, when its repository is enabled.
-pub fn managed_worktree(directory: &Path) -> Result<Option<ManagedWorktree>, Error> {
+/// Begin a managed-command decision for the enabled worktree containing `directory`.
+///
+/// The returned value exclusively owns repository lifecycle changes until it is dropped.
+pub fn begin_managed_command(directory: &Path) -> Result<Option<ManagedWorktree>, Error> {
     let Some(context) = repository_context_at(directory, true)? else {
         return Ok(None);
     };
     if matches!(status(directory)?, Enrollment::Disabled) {
         return Ok(None);
     }
+    let operation_lock = lock_repository(&context.common_dir)?;
+    if matches!(status(directory)?, Enrollment::Disabled) {
+        return Ok(None);
+    }
 
     let identity = identity_for(&context)?;
-    Ok(Some(ManagedWorktree { context, identity }))
+    Ok(Some(ManagedWorktree {
+        context,
+        identity,
+        _operation_lock: operation_lock,
+    }))
 }
 
 /// Return tracked and unignored untracked files with the requested basename.
@@ -177,9 +209,11 @@ pub fn source_files_named(root: &Path, file_name: &str) -> Result<Vec<PathBuf>, 
         .collect()
 }
 
+/// An enabled worktree held for one managed-command decision.
 pub struct ManagedWorktree {
     context: RepositoryContext,
     identity: WorktreeIdentity,
+    _operation_lock: File,
 }
 
 impl ManagedWorktree {
@@ -199,20 +233,31 @@ impl ManagedWorktree {
     }
 }
 
+fn lock_repository(common_directory: &Path) -> Result<File, Error> {
+    let path = common_directory.join(REPOSITORY_LOCK_FILE);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| Error::RepositoryLock {
+            path: path.clone(),
+            source,
+        })?;
+    lock.lock()
+        .map_err(|source| Error::RepositoryLock { path, source })?;
+    Ok(lock)
+}
+
 fn identity_for(context: &RepositoryContext) -> Result<WorktreeIdentity, Error> {
-    let repository_id = local_config_at(
-        "read the Ragavan repository identity",
-        &context.common_dir,
-        REPOSITORY_ID_KEY,
-    )?
-    .ok_or(Error::MissingRepositoryId)
-    .and_then(parse_repository_id)?;
+    let repository_id =
+        repository_id_at("read the Ragavan repository identity", &context.common_dir)?
+            .ok_or(Error::MissingRepositoryId)
+            .and_then(parse_repository_id)?;
     let worktree_id = worktree_id(context)?;
 
-    WorktreeIdentity::new(repository_id, worktree_id).map_err(|error| match error {
-        IdentityError::EmptyRepository => Error::InvalidRepositoryId,
-        IdentityError::EmptyWorktree => Error::InvalidWorktreeId,
-    })
+    WorktreeIdentity::new(repository_id, worktree_id).map_err(|_| Error::InvalidWorktreeId)
 }
 
 fn worktree_id(context: &RepositoryContext) -> Result<String, Error> {
@@ -238,7 +283,7 @@ fn worktree_id(context: &RepositoryContext) -> Result<String, Error> {
 
 fn ensure_repository_id(common_directory: &Path) -> Result<RepositoryId, Error> {
     const OPERATION: &str = "enable Ragavan for the repository";
-    if let Some(repository_id) = local_config_at(OPERATION, common_directory, REPOSITORY_ID_KEY)? {
+    if let Some(repository_id) = repository_id_at(OPERATION, common_directory)? {
         return parse_repository_id(repository_id);
     }
 
@@ -247,16 +292,16 @@ fn ensure_repository_id(common_directory: &Path) -> Result<RepositoryId, Error> 
         OPERATION,
         common_directory,
         REPOSITORY_ID_KEY,
-        &repository_id,
+        repository_id.as_str(),
     )?;
-    parse_repository_id(repository_id)
+    Ok(repository_id)
 }
 
 fn parse_repository_id(value: String) -> Result<RepositoryId, Error> {
     RepositoryId::new(value).map_err(|_| Error::InvalidRepositoryId)
 }
 
-fn new_repository_id() -> String {
+fn new_repository_id() -> RepositoryId {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -264,7 +309,8 @@ fn new_repository_id() -> String {
     let sequence = NEXT_REPOSITORY_ID.fetch_add(1, Ordering::Relaxed);
     let process_id = std::process::id();
 
-    format!("{timestamp:032x}{process_id:08x}{sequence:016x}")
+    RepositoryId::new(format!("{timestamp:032x}{process_id:08x}{sequence:016x}"))
+        .expect("generated repository identities must satisfy the domain format")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,11 +406,14 @@ pub fn inspect_repository(common_directory: &Path) -> Result<Option<RepositoryIn
     }
 
     let enrollment = enrollment_at(common_directory)?;
-    let identity = configured_identity(local_config_at(
+    let identity = match repository_id_at(
         "read a registered Ragavan repository identity",
         common_directory,
-        REPOSITORY_ID_KEY,
-    )?);
+    ) {
+        Ok(value) => configured_identity(value),
+        Err(Error::InvalidRepositoryId) => RepositoryIdentity::Invalid,
+        Err(error) => return Err(error),
+    };
     let worktrees = list_worktrees(common_directory)?;
 
     Ok(Some(RepositoryInspection {
@@ -410,20 +459,31 @@ fn enrollment_from_output(operation: &'static str, output: Output) -> Result<Enr
     Err(Error::git(operation, output))
 }
 
-fn local_config_at(
+fn repository_id_at(
     operation: &'static str,
     common_directory: &Path,
-    key: &str,
 ) -> Result<Option<String>, Error> {
     let output = git_in_common_directory(
         operation,
         common_directory,
-        &["config", "--local", "--get", key],
+        &[
+            "config",
+            "--local",
+            "--null",
+            "--get-all",
+            REPOSITORY_ID_KEY,
+        ],
     )?;
     if output.status.success() {
-        return Ok(Some(
-            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-        ));
+        let value = output
+            .stdout
+            .strip_suffix(b"\0")
+            .ok_or(Error::InvalidRepositoryId)?;
+        if value.contains(&0) {
+            return Err(Error::InvalidRepositoryId);
+        }
+        let value = std::str::from_utf8(value).map_err(|_| Error::InvalidRepositoryId)?;
+        return Ok(Some(value.to_owned()));
     }
     if output.status.code() == Some(GIT_CONFIG_GET_MISSING) {
         return Ok(None);
@@ -656,6 +716,10 @@ pub enum Error {
         path: PathBuf,
         source: io::Error,
     },
+    RepositoryLock {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl Error {
@@ -704,7 +768,7 @@ impl fmt::Display for Error {
                 "source filename `{file_name}` must contain only letters, numbers, dots, hyphens, or underscores"
             ),
             Self::InvalidRepositoryId => {
-                formatter.write_str("the Ragavan repository identity is empty")
+                formatter.write_str("the Ragavan repository identity is malformed")
             }
             Self::InvalidWorktreeId => {
                 formatter.write_str("Git returned an empty worktree identity")
@@ -737,6 +801,11 @@ impl fmt::Display for Error {
                 "could not inspect registered Git common directory {}: {source}",
                 path.display()
             ),
+            Self::RepositoryLock { path, source } => write!(
+                formatter,
+                "could not coordinate Ragavan repository operations at {}: {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -747,6 +816,7 @@ impl std::error::Error for Error {
             Self::StartGit { source, .. } => Some(source),
             Self::NonUtf8GitOutput { source, .. } => Some(source),
             Self::InspectCommonDirectory { source, .. } => Some(source),
+            Self::RepositoryLock { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -767,6 +837,7 @@ impl Diagnostic for Error {
             Self::WorktreeRequired { .. } => "git.worktree.required",
             Self::InvalidCommonDirectory { .. } => "git.common_directory.invalid",
             Self::InspectCommonDirectory { .. } => "git.common_directory.inspect",
+            Self::RepositoryLock { .. } => "git.repository.lock",
         }
     }
 
@@ -814,11 +885,152 @@ impl Diagnostic for Error {
             Self::WorktreeRequired { operation } => {
                 vec![Detail::text("operation", *operation)]
             }
-            Self::InvalidCommonDirectory { path } | Self::InspectCommonDirectory { path, .. } => {
+            Self::InvalidCommonDirectory { path }
+            | Self::InspectCommonDirectory { path, .. }
+            | Self::RepositoryLock { path, .. } => {
                 vec![Detail::text("path", path.display().to_string())]
             }
             Self::InvalidRepositoryId | Self::InvalidWorktreeId | Self::MissingRepositoryId => {
                 Vec::new()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Enrollment, REPOSITORY_LOCK_FILE, RepositoryIdentity, begin_disable, begin_enable,
+        inspect_repository, status,
+    };
+    use std::{
+        fs::{self, OpenOptions, TryLockError},
+        io::{self, Write},
+        path::{Path, PathBuf},
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn a_repository_transition_owns_exclusive_mutation_until_it_finishes() {
+        let repository = TestRepository::new();
+        let transition = begin_enable(repository.path())
+            .expect("the repository should begin its enable transition");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(transition.common_directory().join(REPOSITORY_LOCK_FILE))
+            .expect("the repository lock should exist");
+
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert_eq!(
+            transition.complete().expect("enabling should complete"),
+            Enrollment::Enabled
+        );
+        contender
+            .try_lock()
+            .expect("finishing the transition should release the repository");
+    }
+
+    #[test]
+    fn a_malformed_repository_identity_remains_inspectable_and_disableable() {
+        let repository = TestRepository::new();
+        let common_directory = repository.path().join(".git");
+        OpenOptions::new()
+            .append(true)
+            .open(common_directory.join("config"))
+            .expect("the Git config should open")
+            .write_all(b"\n[ragavan]\n\trepositoryId = \xff\n\tenabled = true\n")
+            .expect("the malformed repository identity should be written");
+
+        assert_invalid_identity_can_be_disabled(&repository);
+    }
+
+    #[test]
+    fn multiple_repository_identities_remain_inspectable_and_disableable() {
+        let repository = TestRepository::new();
+        OpenOptions::new()
+            .append(true)
+            .open(repository.path().join(".git").join("config"))
+            .expect("the Git config should open")
+            .write_all(
+                b"\n[ragavan]\n\trepositoryId = first\n\trepositoryId = second\n\tenabled = true\n",
+            )
+            .expect("the duplicate repository identities should be written");
+
+        assert_invalid_identity_can_be_disabled(&repository);
+    }
+
+    fn assert_invalid_identity_can_be_disabled(repository: &TestRepository) {
+        let inspection = inspect_repository(&repository.path().join(".git"))
+            .expect("the repository should remain inspectable")
+            .expect("the repository should exist");
+        assert_eq!(inspection.identity(), &RepositoryIdentity::Invalid);
+
+        let transition = begin_disable(repository.path())
+            .expect("a malformed identity should not prevent disabling");
+        assert_eq!(transition.repository_id(), None);
+        assert_eq!(
+            transition.complete().expect("disabling should complete"),
+            Enrollment::Disabled
+        );
+        assert_eq!(
+            status(repository.path()).expect("enrollment should remain readable"),
+            Enrollment::Disabled
+        );
+    }
+
+    struct TestRepository {
+        container: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestRepository {
+        fn new() -> Self {
+            for _ in 0..100 {
+                let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let container = std::env::temp_dir().join(format!(
+                    "ragavan-git-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&container) {
+                    Ok(()) => {
+                        let path = container.join("repository");
+                        let output = Command::new("git")
+                            .args(["init", "--initial-branch=main"])
+                            .arg(&path)
+                            .output()
+                            .expect("Git should start");
+                        assert!(output.status.success(), "{output:?}");
+                        return Self { container, path };
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        panic!("could not create test directory {container:?}: {error}")
+                    }
+                }
+            }
+
+            panic!("could not allocate a unique test directory")
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestRepository {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.container) {
+                eprintln!(
+                    "could not remove test directory {:?}: {error}",
+                    self.container
+                );
             }
         }
     }

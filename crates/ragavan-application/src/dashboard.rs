@@ -1,7 +1,7 @@
 use crate::Error;
 use crate::{Enrollment, LeaseState, RepositoryId};
 use ragavan_git::{RepositoryIdentity, RepositoryInspection, WorktreeInspection};
-use ragavan_runtime::ServiceAssignment;
+use ragavan_runtime::{RuntimeSnapshot, ServiceAssignment};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -182,6 +182,7 @@ fn load_all() -> Result<Dashboard, Error> {
             .remove(registration.repository_id())
             .unwrap_or_default();
         repositories.push(registered_repository(
+            &snapshot,
             registration.repository_id().clone(),
             registration.common_directory().to_owned(),
             repository_services,
@@ -203,11 +204,9 @@ fn load_repository(directory: &Path) -> Result<Dashboard, Error> {
     let repository = match ragavan_git::inspect_repository(&common_directory)? {
         Some(inspection) => {
             let observed_id = inspection.identity().repository_id();
-            let repository_id = snapshot
+            let registered_id = snapshot
                 .registration_for_directory(&common_directory)?
-                .map(|registration| registration.repository_id().clone())
-                .or_else(|| observed_id.cloned());
-            let services = services_for_repository(snapshot.services(), repository_id.as_ref());
+                .map(|registration| registration.repository_id().clone());
             let registered_directory = observed_id
                 .map(|repository_id| {
                     snapshot.conflicting_repository_directory(repository_id, &common_directory)
@@ -215,6 +214,15 @@ fn load_repository(directory: &Path) -> Result<Dashboard, Error> {
                 .transpose()?
                 .flatten()
                 .map(PathBuf::from);
+            let service_repository_id = registered_id.as_ref().or_else(|| {
+                if registered_directory.is_none() {
+                    observed_id
+                } else {
+                    None
+                }
+            });
+            let services = services_for_repository(snapshot.services(), service_repository_id);
+            let repository_id = registered_id.or_else(|| observed_id.cloned());
             repository_from_inspection(
                 repository_id,
                 common_directory,
@@ -245,18 +253,30 @@ fn services_for_repository(
 }
 
 fn registered_repository(
+    snapshot: &RuntimeSnapshot,
     repository_id: RepositoryId,
     common_directory: PathBuf,
     services: Vec<ServiceAssignment>,
 ) -> Result<DashboardRepository, Error> {
     Ok(match ragavan_git::inspect_repository(&common_directory)? {
-        Some(inspection) => repository_from_inspection(
-            Some(repository_id),
-            common_directory,
-            services,
-            inspection,
-            None,
-        ),
+        Some(inspection) => {
+            let registered_directory = inspection
+                .identity()
+                .repository_id()
+                .map(|observed_id| {
+                    snapshot.conflicting_repository_directory(observed_id, &common_directory)
+                })
+                .transpose()?
+                .flatten()
+                .map(PathBuf::from);
+            repository_from_inspection(
+                Some(repository_id),
+                common_directory,
+                services,
+                inspection,
+                registered_directory,
+            )
+        }
         None => unavailable_repository(Some(repository_id), common_directory, services),
     })
 }

@@ -319,6 +319,59 @@ fn a_registered_identity_mismatch_is_reported_without_guessing() {
 }
 
 #[test]
+fn the_global_dashboard_identifies_the_other_live_repository_behind_a_mismatch() {
+    let first = TestRepository::new();
+    let second = TestRepository::new();
+    let state = TempDirectory::new();
+    assert_success(&ragavan_with_state(first.path(), state.path(), &["enable"]));
+    assert_success(&ragavan_with_state(
+        second.path(),
+        state.path(),
+        &["enable"],
+    ));
+    let first_id = stdout(&git(
+        first.path(),
+        &["config", "--local", "--get", "ragavan.repositoryId"],
+    ));
+    let second_id = stdout(&git(
+        second.path(),
+        &["config", "--local", "--get", "ragavan.repositoryId"],
+    ));
+    let second_common_directory = stdout(&git(
+        second.path(),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ));
+    assert_success(&git(
+        first.path(),
+        &[
+            "config",
+            "--local",
+            "ragavan.repositoryId",
+            second_id.trim(),
+        ],
+    ));
+
+    let output = ragavan_with_state(state.path(), state.path(), &["dashboard", "--json"]);
+
+    assert_success(&output);
+    let dashboard = json_stdout(&output);
+    let first = dashboard["repositories"]
+        .as_array()
+        .and_then(|repositories| {
+            repositories
+                .iter()
+                .find(|repository| repository["id"] == first_id.trim())
+        })
+        .expect("the first registration should remain visible");
+    assert_eq!(first["state"], "identity_mismatch");
+    assert_eq!(first["observed_id"], second_id.trim());
+    assert_eq!(
+        first["registered_directory"],
+        second_common_directory.trim()
+    );
+}
+
+#[test]
 fn duplicate_live_repository_identities_are_rejected() {
     let first = TestRepository::new();
     let copied = TestRepository::new();

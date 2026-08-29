@@ -1,22 +1,17 @@
 use super::harness::{
     FakeCommand, development_port, development_port_for, package_runner, start_package_runner,
-    stop_runner,
+    stop_runner, write_package,
 };
 use crate::support::{
-    ENABLED, TestRepository, assert_stdout, assert_success, git, ragavan, stderr, stdout,
+    ENABLED, TestRepository, assert_stdout, assert_success, git, ragavan, ragavan_with_state,
+    stderr, stdout, test_state_home,
 };
 use std::{fs, path::PathBuf};
 
 #[test]
 fn dashboard_reports_active_and_inactive_service_leases() {
     let repository = TestRepository::new();
-    fs::write(
-        repository.path().join("package.json"),
-        r#"{"scripts":{"dev":"vite"}}"#,
-    )
-    .expect("package should be written");
-    assert_stdout(git(repository.path(), &["add", "package.json"]), "");
-    assert_success(&git(repository.path(), &["commit", "-m", "add package"]));
+    write_package(&repository, r#"{"scripts":{"dev":"vite"}}"#);
     assert_stdout(ragavan(repository.path(), &["enable"]), ENABLED);
     let bun = FakeCommand::waiting("bun");
     let (process, port) = start_package_runner(repository.path(), "bun", bun.path(), &["dev"]);
@@ -50,6 +45,47 @@ fn dashboard_reports_active_and_inactive_service_leases() {
         unregistered["repositories"][0]["worktrees"][0]["services"][0]["port"],
         port
     );
+}
+
+#[test]
+fn a_conflicting_repository_does_not_claim_another_repository_services() {
+    let original = TestRepository::new();
+    write_package(&original, r#"{"scripts":{"dev":"vite"}}"#);
+    assert_stdout(ragavan(original.path(), &["enable"]), ENABLED);
+    let _original_port = development_port(original.path());
+    let repository_id = stdout(&git(
+        original.path(),
+        &["config", "--local", "--get", "ragavan.repositoryId"],
+    ));
+    let state_home = test_state_home(original.path());
+    let copied = TestRepository::new();
+    assert_success(&git(
+        copied.path(),
+        &[
+            "config",
+            "--local",
+            "ragavan.repositoryId",
+            repository_id.trim(),
+        ],
+    ));
+
+    let output = ragavan_with_state(
+        copied.path(),
+        &state_home,
+        &["dashboard", "--current", "--json"],
+    );
+
+    assert_success(&output);
+    let dashboard = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .expect("the current dashboard should be JSON");
+    let repository = &dashboard["repositories"][0];
+    assert_eq!(repository["state"], "identity_mismatch");
+    assert!(repository["registered_directory"].is_string());
+    assert!(repository["worktrees"].as_array().is_some_and(|worktrees| {
+        worktrees
+            .iter()
+            .all(|worktree| worktree["services"].as_array().is_some_and(Vec::is_empty))
+    }));
 }
 
 #[test]

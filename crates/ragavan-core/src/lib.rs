@@ -6,6 +6,8 @@ use std::{
     path::{Component, Path},
 };
 
+const REPOSITORY_ID_MAX_LENGTH: usize = 128;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Enrollment {
     Enabled,
@@ -22,17 +24,27 @@ pub enum LeaseState {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// A stable, opaque identity shared by one repository's worktrees and services.
 pub struct RepositoryId(String);
 
 impl RepositoryId {
+    /// Validate a persisted repository identity.
     pub fn new(value: String) -> Result<Self, IdentityError> {
         if value.is_empty() {
             return Err(IdentityError::EmptyRepository);
+        }
+        if value.len() > REPOSITORY_ID_MAX_LENGTH
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(IdentityError::InvalidRepository);
         }
 
         Ok(Self(value))
     }
 
+    /// Return the canonical persisted identity.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -74,6 +86,7 @@ impl WorktreeIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentityError {
     EmptyRepository,
+    InvalidRepository,
     EmptyWorktree,
 }
 
@@ -81,6 +94,10 @@ impl fmt::Display for IdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyRepository => formatter.write_str("repository identity cannot be empty"),
+            Self::InvalidRepository => write!(
+                formatter,
+                "repository identity must contain at most {REPOSITORY_ID_MAX_LENGTH} ASCII letters, numbers, hyphens, or underscores"
+            ),
             Self::EmptyWorktree => formatter.write_str("worktree identity cannot be empty"),
         }
     }
@@ -92,6 +109,7 @@ impl Diagnostic for IdentityError {
     fn code(&self) -> &'static str {
         match self {
             Self::EmptyRepository => "identity.repository.empty",
+            Self::InvalidRepository => "identity.repository.invalid",
             Self::EmptyWorktree => "identity.worktree.empty",
         }
     }
@@ -100,7 +118,7 @@ impl Diagnostic for IdentityError {
         vec![Detail::text(
             "identity",
             match self {
-                Self::EmptyRepository => "repository",
+                Self::EmptyRepository | Self::InvalidRepository => "repository",
                 Self::EmptyWorktree => "worktree",
             },
         )]
@@ -277,11 +295,20 @@ mod tests {
     }
 
     #[test]
-    fn repository_identifiers_cannot_be_empty() {
+    fn repository_identifiers_have_a_safe_bounded_format() {
         assert_eq!(
             RepositoryId::new(String::new()),
             Err(IdentityError::EmptyRepository)
         );
+        assert_eq!(
+            RepositoryId::new("repository\nidentity".to_owned()),
+            Err(IdentityError::InvalidRepository)
+        );
+        assert_eq!(
+            RepositoryId::new("r".repeat(129)),
+            Err(IdentityError::InvalidRepository)
+        );
+        assert!(RepositoryId::new("r".repeat(128)).is_ok());
         assert_eq!(
             RepositoryId::new("repository".to_owned())
                 .expect("the repository identity should be valid")
