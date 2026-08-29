@@ -1,5 +1,5 @@
 use crate::presentation::{HumanOutput, Response};
-use ragavan_shell::{InstallOutcome, UninstallOutcome};
+use ragavan_application::{InstallOutcome, UninstallOutcome};
 use serde_json::{Map, Value as JsonValue, json};
 use std::{io, path::PathBuf};
 

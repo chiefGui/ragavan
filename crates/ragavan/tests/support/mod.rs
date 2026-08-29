@@ -95,11 +95,23 @@ pub fn ragavan(directory: &Path, arguments: &[&str]) -> Output {
         .expect("Ragavan should start")
 }
 
+#[allow(dead_code)]
+pub fn ragavan_with_state(directory: &Path, state_home: &Path, arguments: &[&str]) -> Output {
+    ragavan_command_with_state(directory, state_home)
+        .args(arguments)
+        .output()
+        .expect("Ragavan should start")
+}
+
 pub fn ragavan_command(directory: &Path) -> Command {
+    ragavan_command_with_state(directory, &test_state_home(directory))
+}
+
+pub fn ragavan_command_with_state(directory: &Path, state_home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ragavan"));
     command
         .current_dir(directory)
-        .env(state_home_variable(), test_state_home(directory));
+        .env(state_home_variable(), state_home);
     command
 }
 

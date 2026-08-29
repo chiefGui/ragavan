@@ -55,16 +55,23 @@ impl<'a> DevelopmentCommand<'a> {
     }
 
     /// Resolve the package service and describe its port-specific adjustment.
-    pub fn resolve(self, worktree_root: &Path) -> Result<IsolationPlan, Error> {
-        let package_script =
-            package::find_script(worktree_root, self.package_target, self.script_name).map_err(
-                |source| {
-                    Error(ErrorKind::Package {
-                        invocation: self.invocation,
-                        source,
-                    })
-                },
-            )?;
+    pub fn resolve(
+        self,
+        working_directory: &Path,
+        worktree_root: &Path,
+    ) -> Result<IsolationPlan, Error> {
+        let package_script = package::find_script(
+            working_directory,
+            worktree_root,
+            self.package_target,
+            self.script_name,
+        )
+        .map_err(|source| {
+            Error(ErrorKind::Package {
+                invocation: self.invocation,
+                source,
+            })
+        })?;
         let (package_path, service_scope, source) = package_script.into_parts();
         let script = match Script::parse(&source) {
             Ok(script) => script,

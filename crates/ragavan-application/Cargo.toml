@@ -1,5 +1,5 @@
 [package]
-name = "ragavan-cli"
+name = "ragavan-application"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anstream.workspace = true
-anstyle.workspace = true
-clap.workspace = true
-ragavan-application.workspace = true
+ragavan-adapters.workspace = true
+ragavan-core.workspace = true
 ragavan-diagnostics.workspace = true
+ragavan-git.workspace = true
+ragavan-runtime.workspace = true
 ragavan-shell.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

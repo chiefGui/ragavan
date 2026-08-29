@@ -14,7 +14,7 @@ pub(super) const ADAPTER: Runner = Runner {
 };
 
 fn recognize(arguments: &[OsString]) -> Option<DevelopmentCommand<'_>> {
-    let mut package_target = PackageTarget::CurrentDirectory;
+    let mut package_target = PackageTarget::WorkingDirectory;
     let mut recursive = false;
     let arguments = consume_target_options(arguments, &mut package_target, &mut recursive)?;
     let (invocation, script_name, script_arguments) = match arguments {
@@ -42,13 +42,13 @@ fn recognize(arguments: &[OsString]) -> Option<DevelopmentCommand<'_>> {
         } else if is_directory_selector(selector) {
             PackageTarget::Selected(PackageSelector::Directory {
                 value: selector,
-                relative_to: SelectorBase::CurrentDirectory,
+                relative_to: SelectorBase::WorkingDirectory,
             })
         } else {
             package_target
         };
     }
-    if recursive && matches!(package_target, PackageTarget::CurrentDirectory) {
+    if recursive && matches!(package_target, PackageTarget::WorkingDirectory) {
         package_target = PackageTarget::Multiple;
     }
 

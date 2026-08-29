@@ -5,21 +5,23 @@ pub(super) use target::{PackageSelector, PackageTarget, SelectorBase};
 use ragavan_core::{ServiceScope, ServiceScopeError};
 use ragavan_diagnostics::{Detail, Diagnostic};
 use std::{
-    env,
     ffi::{OsStr, OsString},
     fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 pub(super) fn find_script(
+    working_directory: &Path,
     worktree_root: &Path,
     target: PackageTarget<'_>,
     script_name: &str,
 ) -> Result<PackageScript, Error> {
     match target {
-        PackageTarget::CurrentDirectory => find_nearest_script(worktree_root, script_name),
+        PackageTarget::WorkingDirectory => {
+            find_nearest_script(working_directory, worktree_root, script_name)
+        }
         PackageTarget::Selected(selector) => {
-            find_selected_script(worktree_root, selector, script_name)
+            find_selected_script(working_directory, worktree_root, selector, script_name)
         }
         PackageTarget::MissingValue(option) => Err(Error::MissingTargetValue(option)),
         PackageTarget::Multiple => Err(Error::MultipleTargets),
@@ -39,19 +41,25 @@ impl PackageScript {
     }
 }
 
-fn find_nearest_script(worktree_root: &Path, script_name: &str) -> Result<PackageScript, Error> {
+fn find_nearest_script(
+    working_directory: &Path,
+    worktree_root: &Path,
+    script_name: &str,
+) -> Result<PackageScript, Error> {
     let resolved_worktree_root = resolve_path(worktree_root)?;
-    let package_path = nearest_package_json(worktree_root, &resolved_worktree_root)?;
+    let package_path =
+        nearest_package_json(working_directory, worktree_root, &resolved_worktree_root)?;
     read_script(&resolved_worktree_root, package_path, script_name)
 }
 
 fn find_selected_script(
+    working_directory: &Path,
     worktree_root: &Path,
     selector: PackageSelector<'_>,
     script_name: &str,
 ) -> Result<PackageScript, Error> {
     let resolved_worktree_root = resolve_path(worktree_root)?;
-    let package_path = selected_package_json(&resolved_worktree_root, selector)?;
+    let package_path = selected_package_json(working_directory, &resolved_worktree_root, selector)?;
     read_script(&resolved_worktree_root, package_path, script_name)
 }
 
@@ -121,20 +129,20 @@ fn resolve_package_path(path: &Path) -> Result<PathBuf, Error> {
 }
 
 fn nearest_package_json(
+    working_directory: &Path,
     worktree_root: &Path,
     resolved_worktree_root: &Path,
 ) -> Result<PathBuf, Error> {
-    let current_directory = env::current_dir().map_err(Error::CurrentDirectory)?;
-    let resolved_current_directory = resolve_path(&current_directory)?;
+    let resolved_working_directory = resolve_path(working_directory)?;
 
-    if !resolved_current_directory.starts_with(resolved_worktree_root) {
-        return Err(Error::CurrentDirectoryOutsideWorktree {
-            current_directory: current_directory.clone(),
+    if !resolved_working_directory.starts_with(resolved_worktree_root) {
+        return Err(Error::WorkingDirectoryOutsideWorktree {
+            working_directory: working_directory.to_owned(),
             root: worktree_root.to_owned(),
         });
     }
 
-    for directory in resolved_current_directory.ancestors() {
+    for directory in resolved_working_directory.ancestors() {
         let package_path = directory.join("package.json");
         match fs::metadata(&package_path) {
             Ok(metadata) if metadata.is_file() => return Ok(package_path),
@@ -155,13 +163,14 @@ fn nearest_package_json(
         }
     }
 
-    Err(Error::CurrentDirectoryOutsideWorktree {
-        current_directory,
+    Err(Error::WorkingDirectoryOutsideWorktree {
+        working_directory: working_directory.to_owned(),
         root: worktree_root.to_owned(),
     })
 }
 
 fn selected_package_json(
+    working_directory: &Path,
     resolved_worktree_root: &Path,
     selector: PackageSelector<'_>,
 ) -> Result<PathBuf, Error> {
@@ -177,7 +186,7 @@ fn selected_package_json(
             packages_below(resolved_worktree_root, resolved_worktree_root, Some(name))?
         }
         PackageSelector::Directory { value, relative_to } => {
-            let base = selector_base(resolved_worktree_root, relative_to)?;
+            let base = selector_base(working_directory, resolved_worktree_root, relative_to)?;
             selected_directory_packages(
                 resolved_worktree_root,
                 &base,
@@ -186,7 +195,7 @@ fn selected_package_json(
             )?
         }
         PackageSelector::NameOrDirectory { value, relative_to } => {
-            let base = selector_base(resolved_worktree_root, relative_to)?;
+            let base = selector_base(working_directory, resolved_worktree_root, relative_to)?;
             let mut packages = selected_directory_packages(
                 resolved_worktree_root,
                 &base,
@@ -212,12 +221,13 @@ fn selected_package_json(
     exactly_one_package(packages, resolved_worktree_root, value)
 }
 
-fn selector_base(root: &Path, base: SelectorBase) -> Result<PathBuf, Error> {
+fn selector_base(
+    working_directory: &Path,
+    root: &Path,
+    base: SelectorBase,
+) -> Result<PathBuf, Error> {
     match base {
-        SelectorBase::CurrentDirectory => {
-            let current_directory = env::current_dir().map_err(Error::CurrentDirectory)?;
-            resolve_path(&current_directory)
-        }
+        SelectorBase::WorkingDirectory => resolve_path(working_directory),
         SelectorBase::WorktreeRoot => Ok(root.to_owned()),
     }
 }
@@ -380,13 +390,12 @@ pub(super) enum Error {
     MissingTargetValue(&'static str),
     MultipleTargets,
     NonExactTarget(OsString),
-    CurrentDirectory(io::Error),
     ResolvePath {
         path: PathBuf,
         source: io::Error,
     },
-    CurrentDirectoryOutsideWorktree {
-        current_directory: PathBuf,
+    WorkingDirectoryOutsideWorktree {
+        working_directory: PathBuf,
         root: PathBuf,
     },
     PackageOutsideWorktree {
@@ -447,9 +456,6 @@ impl fmt::Display for Error {
                 "package selector {:?} is not an exact package name or directory; Ragavan requires exactly one package",
                 selector.to_string_lossy()
             ),
-            Self::CurrentDirectory(source) => {
-                write!(formatter, "could not read the current directory: {source}")
-            }
             Self::ResolvePath { path, source } => {
                 write!(
                     formatter,
@@ -457,13 +463,13 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
-            Self::CurrentDirectoryOutsideWorktree {
-                current_directory,
+            Self::WorkingDirectoryOutsideWorktree {
+                working_directory,
                 root,
             } => write!(
                 formatter,
-                "current directory {} is outside Git worktree {}",
-                current_directory.display(),
+                "working directory {} is outside Git worktree {}",
+                working_directory.display(),
                 root.display()
             ),
             Self::PackageOutsideWorktree { package, root } => write!(
@@ -485,7 +491,7 @@ impl fmt::Display for Error {
             ),
             Self::MissingPackage { root } => write!(
                 formatter,
-                "no package.json exists between the current directory and {}",
+                "no package.json exists between the working directory and {}",
                 root.display()
             ),
             Self::MissingSelectedPackage { selector, root } => write!(
@@ -527,7 +533,6 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CurrentDirectory(source) => Some(source),
             Self::ResolvePath { source, .. } => Some(source),
             Self::ResolvePackageTarget { source, .. } => Some(source),
             Self::DiscoverPackages { source, .. } => Some(source),
@@ -545,10 +550,9 @@ impl Diagnostic for Error {
             Self::MissingTargetValue(_) => "package.target.value_missing",
             Self::MultipleTargets => "package.target.multiple",
             Self::NonExactTarget(_) => "package.target.non_exact",
-            Self::CurrentDirectory(_) => "package.current_directory.read",
             Self::ResolvePath { .. } => "package.path.resolve",
-            Self::CurrentDirectoryOutsideWorktree { .. } => {
-                "package.current_directory.outside_worktree"
+            Self::WorkingDirectoryOutsideWorktree { .. } => {
+                "package.working_directory.outside_worktree"
             }
             Self::PackageOutsideWorktree { .. } => "package.path.outside_worktree",
             Self::PackageTargetOutsideWorktree { .. } => "package.target.outside_worktree",
@@ -573,7 +577,7 @@ impl Diagnostic for Error {
             | Self::AmbiguousSelectedPackage { .. } => {
                 Some("select exactly one package by its name or directory".to_owned())
             }
-            Self::CurrentDirectoryOutsideWorktree { .. }
+            Self::WorkingDirectoryOutsideWorktree { .. }
             | Self::PackageOutsideWorktree { .. }
             | Self::PackageTargetOutsideWorktree { .. } => {
                 Some("run the command for a package inside the enrolled Git worktree".to_owned())
@@ -588,8 +592,7 @@ impl Diagnostic for Error {
             Self::MissingScript { name, .. } => Some(format!(
                 "define `scripts.{name}` as a string in package.json"
             )),
-            Self::CurrentDirectory(_)
-            | Self::ResolvePath { .. }
+            Self::ResolvePath { .. }
             | Self::ResolvePackageTarget { .. }
             | Self::ReadPackage { .. } => None,
         }
@@ -604,11 +607,11 @@ impl Diagnostic for Error {
                     selector.to_string_lossy().into_owned(),
                 )]
             }
-            Self::CurrentDirectoryOutsideWorktree {
-                current_directory,
+            Self::WorkingDirectoryOutsideWorktree {
+                working_directory,
                 root,
             } => vec![
-                Detail::text("current_directory", current_directory.display().to_string()),
+                Detail::text("working_directory", working_directory.display().to_string()),
                 Detail::text("worktree", root.display().to_string()),
             ],
             Self::PackageOutsideWorktree { package, root } => vec![
@@ -646,7 +649,7 @@ impl Diagnostic for Error {
                 Detail::text("package", path.display().to_string()),
                 Detail::text("script", name),
             ],
-            Self::MultipleTargets | Self::CurrentDirectory(_) => Vec::new(),
+            Self::MultipleTargets => Vec::new(),
         }
     }
 }

@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 
 #[derive(Clone, Copy)]
 pub(crate) enum PackageTarget<'a> {
-    CurrentDirectory,
+    WorkingDirectory,
     Selected(PackageSelector<'a>),
     MissingValue(&'static str),
     Multiple,
@@ -17,7 +17,7 @@ impl<'a> PackageTarget<'a> {
         }
 
         *self = match *self {
-            Self::CurrentDirectory => Self::Selected(selector),
+            Self::WorkingDirectory => Self::Selected(selector),
             Self::Selected(existing) if existing == selector => *self,
             Self::MissingValue(_) => *self,
             Self::Selected(_) | Self::Multiple | Self::NonExact(_) => Self::Multiple,
@@ -50,6 +50,6 @@ impl<'a> PackageSelector<'a> {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum SelectorBase {
-    CurrentDirectory,
+    WorkingDirectory,
     WorktreeRoot,
 }
